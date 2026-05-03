@@ -99,7 +99,7 @@ async function doFetch(targetUrl, request) {
                             }
                             
                             const workerUrl = `https://${worker}${parsed.pathname}${parsed.search}`;
-                            src.url = await proxyToken(workerUrl, { origin, referer });
+                            src.url = await proxyToken(workerUrl);
                             rewritten = true;
                         } catch { /* malformed — leave url as-is */ }
                     }
@@ -108,7 +108,6 @@ async function doFetch(targetUrl, request) {
                         const worker = nextWorkerHost();
                         let proxyUrl = `https://${worker}/mp4-proxy?url=${encodeURIComponent(src.url)}`;
                         // Pass origin/referer headers to CF worker if provided by backend
-                        let origin = null, referer = null;
                         if (src.headers) {
                             const hdrs = typeof src.headers === 'string' ? JSON.parse(src.headers) : src.headers;
                             const cleanHdrs = {};
@@ -117,14 +116,12 @@ async function doFetch(targetUrl, request) {
                                 if (lowerK !== "x-forwarded-for" && lowerK !== "x-real-ip") {
                                     cleanHdrs[k] = v;
                                 }
-                                if (lowerK === "origin") origin = v;
-                                if (lowerK === "referer") referer = v;
                             }
                             if (cleanHdrs.origin || cleanHdrs.referer || cleanHdrs["user-agent"]) {
                                 proxyUrl += `&headers=${encodeURIComponent(JSON.stringify(cleanHdrs))}`;
                             }
                         }
-                        src.url = await proxyToken(proxyUrl, { origin, referer });
+                        src.url = await proxyToken(proxyUrl);
                         rewritten = true;
                     }
                     delete src.headers; // never expose raw CDN credentials to client
