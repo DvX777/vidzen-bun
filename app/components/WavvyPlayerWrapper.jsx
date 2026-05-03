@@ -300,11 +300,15 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         if (isCancelled || v.networkState === 3 /* NETWORK_NO_SOURCE */) return;
         setLoading(false);
         setSwitchMsg(null);
-        // Try autoplay
+        // Try autoplay using the mute trick to bypass strict browser policies
+        const wasMuted = v.muted;
+        v.muted = true;
         const playPromise = v.play();
         if (playPromise !== undefined) {
-          playPromise.catch(e => {
+          playPromise.then(() => { if (!wasMuted) v.muted = false; })
+          .catch(e => {
             if (e.name !== "AbortError") console.warn('[VidzenPlayer] MP4 autoplay blocked:', e.message);
+            v.muted = wasMuted;
           });
         }
       };
