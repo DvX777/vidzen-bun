@@ -1,0 +1,24 @@
+// app/embed/movie/[id]/page.jsx
+import WavvyPlayerWrapper from '../../../components/WavvyPlayerWrapper';
+
+export const dynamic = 'force-dynamic';
+
+export async function generateMetadata({ params }) {
+  const { id } = await params;
+  return {
+    title: `Watch Movie — VidZen`,
+    description: `Stream movie ${id} on VidZen`,
+    other: { 'X-Frame-Options': 'ALLOWALL' },
+  };
+}
+
+export default async function MovieEmbedPage({ params }) {
+  const { id } = await params;
+  return (
+    <main style={{ background: '#000', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
+      <div style={{ width: '100%', maxWidth: '100vw' }}>
+        <WavvyPlayerWrapper type="movie" id={id} />
+      </div>
+    </main>
+  );
+}

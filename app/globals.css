@@ -1,0 +1,4 @@
+/* globals.css — minimal reset, everything else is inline or component-scoped */
+*, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+html { scroll-behavior: smooth; }
+body { background: #050507; color: #e4e4e7; }
