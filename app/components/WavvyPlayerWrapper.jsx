@@ -45,7 +45,7 @@ const SERVERS=[
   {id:"hi-px",cc:"in",name:"Delta",  provider:"piexe",   dub:null,              dubLabel:"Hindi audio"},
   {id:"hi-mb",cc:"in",name:"Flux",   provider:"moviebox",dub:["Hindi"],          dubLabel:"Hindi audio"},
   {id:"fr-mb",cc:"fr",name:"Gama",   provider:"moviebox",dub:["French"],         dubLabel:"French audio"},
-  {id:"pt-mb",cc:"br",name:"Nova",   provider:"moviebox",dub:["Portuguese","Brazil"],dubLabel:"Portuguese audio"},
+  {id:"pt-mb",cc:"pt",name:"Nova",   provider:"moviebox",dub:["Portuguese","Brazil"],dubLabel:"Portuguese audio"},
   {id:"jp-mb",cc:"jp",name:"Sakura", provider:"moviebox",dub:["Japanese"],       dubLabel:"Japanese audio"},
   {id:"ar-mb",cc:"sa",name:"Zara",   provider:"moviebox",dub:["Arabic"],          dubLabel:"Arabic audio"},
   {id:"ru-mb",cc:"ru",name:"Storm",  provider:"moviebox",dub:["Russian"],         dubLabel:"Russian audio"},
