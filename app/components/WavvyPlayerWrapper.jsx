@@ -104,14 +104,17 @@ function RoseCurveSpinner({size=72}){
 export default function WavvyPlayerWrapper({type,id,season,episode}){
   const containerRef=useRef(null),videoRef=useRef(null),hlsRef=useRef(null);
   const hideRef=useRef(null),progRef=useRef(null);
+  // ── Refs (always-current, no stale closures) ──────────────────────────────
+  const loadJobRef=useRef(null);
+  const provCacheRef=useRef({});
+  const failedRef=useRef(new Set());
+  const activeProvRef=useRef(null);
 
-  const [src,setSrc]=useState(null);
-  const [srcType,setSrcType]=useState(null);
+  // ── UI State ──────────────────────────────────────────────────────────────
   const [loading,setLoading]=useState(true);
   const [err,setErr]=useState(null);
-  const [subs,setSubs]=useState([]);
-  const [activeSub,setActiveSub]=useState(null);
-  const [cues,setCues]=useState([]);
+  const [switchMsg,setSwitchMsg]=useState(null);
+  const [buffering,setBuffering]=useState(false);
   const [isPlaying,setIsPlaying]=useState(false);
   const [cur,setCur]=useState(0);
   const [dur,setDur]=useState(0);
@@ -120,275 +123,179 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   const [muted,setMuted]=useState(false);
   const [fs,setFs]=useState(false);
   const [showCtrl,setShowCtrl]=useState(true);
+  const [showMenu,setShowMenu]=useState(false);
   const [showSettings,setShowSettings]=useState(false);
   const [settSect,setSettSect]=useState(null);
   const [speed,setSpeedState]=useState("1");
-  const [showMenu,setShowMenu]=useState(false);
-  const [activeProv,setActiveProv]=useState(null);
-  const [activeSource,setActiveSource]=useState(null); // full source obj currently playing
-  const [allSources,setAllSources]=useState({});       // {piexe:[...], moviebox:[...], ...}
-  const [poster,setPoster]=useState(null);
-  const failedProviders=useRef(new Set());
-  const [switchMsg,setSwitchMsg]=useState(null);
+  const [subs,setSubs]=useState([]);
+  const [activeSub,setActiveSub]=useState(null);
+  const [cues,setCues]=useState([]);
   const [hlsLevels,setHlsLevels]=useState([]);
   const [hlsCurrentLevel,setHlsCurrentLevel]=useState(-1);
-  const [needsPlay,setNeedsPlay]=useState(false);
-  const [buffering,setBuffering]=useState(false);
+  const [poster,setPoster]=useState(null);
+  const [activeProv,setActiveProv]=useState(null);
+  const [activeSource,setActiveSource]=useState(null);
+  const [allSources,setAllSources]=useState({});
+  const [srcType,setSrcType]=useState(null);
 
-  // TMDB poster
   useEffect(()=>{
     fetch(`https://api.themoviedb.org/3/${type}/${id}?api_key=${TMDB_KEY}`)
       .then(r=>r.json()).then(d=>{if(d.backdrop_path)setPoster(`https://image.tmdb.org/t/p/w1280${d.backdrop_path}`);})
       .catch(()=>{});
   },[type,id]);
 
-  // Subtitle fetch — calls /api/subs which queries Wyzie and returns VTT-ready URLs
   useEffect(()=>{
     if(!id)return;
     setSubs([]);setActiveSub(null);
     const params=new URLSearchParams({id});
     if(season&&episode){params.set('season',season);params.set('episode',episode);}
-    fetch(`/api/subs?${params}`)
-      .then(r=>r.ok?r.json():[])
+    fetch(`/api/subs?${params}`).then(r=>r.ok?r.json():[])
       .then(data=>{if(Array.isArray(data)&&data.length>0){setSubs(data);console.log(`[VidzenPlayer] Loaded ${data.length} subtitle track(s)`);}})
       .catch(()=>{});
   },[type,id,season,episode]);
 
-  // Store all sources from a provider; load first source of the result
-  const applyResult=useCallback((result)=>{
-    const src0=result.sources[0];
-    setSrc(src0.url);setSrcType(src0.type||"hls");setSubs([]);
-    setActiveSub(null);setErr(null);setActiveProv(result.provider);
-    setActiveSource(src0);
-    setAllSources(prev=>({...prev,[result.provider]:{ sources: result.sources, ts: Date.now() }}));
-    // loading stays true until HLS MANIFEST_PARSED or MP4 loadedmetadata fires
+
+  // ── Core imperative loader ─────────────────────────────────────────────────
+  const playSource=useCallback((url,type_,prov,srcObj)=>{
+    const v=videoRef.current;if(!v)return;
+    const job={cancelled:false};
+    if(loadJobRef.current)loadJobRef.current.cancelled=true;
+    loadJobRef.current=job;
+    if(hlsRef.current){hlsRef.current.destroy();hlsRef.current=null;}
+    v.pause();v.removeAttribute('src');v.load();
+    setHlsLevels([]);setHlsCurrentLevel(-1);setBuffering(false);
+    activeProvRef.current=prov;
+    setActiveProv(prov);setSrcType(type_);
+    if(srcObj)setActiveSource(srcObj);
+    const onReady=()=>{if(!job.cancelled){setLoading(false);setSwitchMsg(null);}};
+    if(type_==="hls"&&Hls.isSupported()){
+      const h=new Hls({enableWorker:true,backBufferLength:60,maxBufferLength:30,
+        startLevel:-1,levelLoadingTimeOut:15000,fragLoadingTimeOut:20000,
+        levelLoadingMaxRetry:3,fragLoadingMaxRetry:3,maxMaxBufferLength:120});
+      h.on(Hls.Events.MANIFEST_PARSED,(_,d)=>{
+        if(job.cancelled)return;
+        console.log('[VidzenPlayer] Manifest OK, levels:',d.levels.length,'src:',url.slice(0,80));
+        setHlsLevels(d.levels);onReady();v.play().catch(()=>{});
+      });
+      h.on(Hls.Events.FRAG_BUFFERED,()=>{if(!job.cancelled)setBuffering(false);});
+      h.on(Hls.Events.ERROR,(_,d)=>{
+        if(job.cancelled||!d.fatal)return;
+        console.warn('[VidzenPlayer] HLS fatal:',d.type,d.details);
+        if(d.type===Hls.ErrorTypes.MEDIA_ERROR&&d.details!=='bufferAddCodecError'){
+          h.recoverMediaError();return;
+        }
+        h.destroy();hlsRef.current=null;autoFallback();
+      });
+      h.on(Hls.Events.LEVEL_SWITCHED,(_,d)=>setHlsCurrentLevel(d.level));
+      console.log('[VidzenPlayer] loadSource:',url.slice(0,100));
+      h.loadSource(url);h.attachMedia(v);hlsRef.current=h;
+    }else if(type_==="hls"){
+      v.src=url;v.addEventListener('loadedmetadata',onReady,{once:true});
+      v.play().catch(()=>{});
+    }else{
+      setTimeout(()=>{
+        if(job.cancelled)return;
+        const onErr=()=>{
+          if(job.cancelled)return;
+          console.warn('[VidzenPlayer] MP4 error:',v.error?.message||'code:'+v.error?.code);
+          const cache=provCacheRef.current[prov]||[];
+          const idx=cache.findIndex(s=>s.url===url);
+          const next=cache[idx+1];
+          if(next&&next.type==='mp4'){playSource(next.url,'mp4',prov,next);return;}
+          autoFallback();
+        };
+        v.addEventListener('error',onErr,{once:true});
+        v.addEventListener('loadedmetadata',onReady,{once:true});
+        const key=`${type}-${id}${season?`-s${season}e${episode}`:''}`;
+        getProgress(key).then(prog=>{if(prog?.watched>5){const fn=()=>{v.currentTime=prog.watched;v.removeEventListener('loadedmetadata',fn);};v.addEventListener('loadedmetadata',fn);}});
+        v.src=url;v.load();v.play().catch(()=>{});
+      },150);
+    }
+  // eslint-disable-next-line react-hooks/exhaustive-deps
   },[]);
 
-  const autoFallback=useCallback(async(failedProv)=>{
-    failedProviders.current.add(failedProv);
+  const autoFallback=useCallback(async()=>{
+    const failed=failedRef.current;
+    failed.add(activeProvRef.current);
     for(const prov of ALL_PROVIDERS){
-      if(failedProviders.current.has(prov))continue;
+      if(failed.has(prov))continue;
       try{
-        setLoading(true);setSwitchMsg(`Trying ${prov}…`);
-        const r=await FETCHERS[prov](type,id,season,episode);
-        applyResult(r);return;
-      }catch(e){
-        failedProviders.current.add(prov);
-      }
+        setSwitchMsg(`Trying ${prov}…`);setLoading(true);
+        let sources=provCacheRef.current[prov];
+        if(!sources?.length){
+          const r=await FETCHERS[prov](type,id,season,episode);
+          sources=r.sources;provCacheRef.current[prov]=sources;
+          setAllSources(prev=>({...prev,[prov]:{sources,ts:Date.now()}}));
+        }
+        const src0=sources[0];
+        playSource(src0.url,src0.type||'hls',prov,src0);
+        return;
+      }catch{failed.add(prov);}
     }
     setErr('All providers failed — please try again later');
     setLoading(false);setSwitchMsg(null);
-  },[type,id,season,episode,applyResult]);
+  },[type,id,season,episode,playSource]);
 
   useEffect(()=>{
-    failedProviders.current.clear();
-    setAllSources({});setActiveSource(null);
-    let dead=false;
+    failedRef.current=new Set();provCacheRef.current={};activeProvRef.current=null;
+    setAllSources({});setActiveProv(null);setActiveSource(null);setSrcType(null);
+    setErr(null);setLoading(true);setSwitchMsg(null);
+    setCues([]);setActiveSub(null);setIsPlaying(false);setCur(0);setDur(0);setBuf(0);
+    let cancelled=false;
     const go=async()=>{
-      setSrc(null);setSrcType(null);setLoading(true);setErr(null);setCues([]);setSwitchMsg(null);
-      setIsPlaying(false);setCur(0);setDur(0);setBuf(0);
-      // Start all fetches concurrently in the background so the menu is populated instantly
-      const fetchPromises = {};
-      ALL_PROVIDERS.forEach((prov) => {
-        fetchPromises[prov] = FETCHERS[prov](type, id, season, episode).then(r => {
-          if (!dead) setAllSources(prev => ({ ...prev, [prov]: { sources: r.sources, ts: Date.now() } }));
+      const promises={};
+      ALL_PROVIDERS.forEach(prov=>{
+        promises[prov]=FETCHERS[prov](type,id,season,episode).then(r=>{
+          if(!cancelled){provCacheRef.current[prov]=r.sources;setAllSources(prev=>({...prev,[prov]:{sources:r.sources,ts:Date.now()}}));}
           return r;
         });
       });
-
-      // Await them in exact priority order (Videasy -> Moviebox -> Piexe)
-      let played = false;
-      for (const prov of ALL_PROVIDERS) {
-        try {
-          const r = await fetchPromises[prov];
-          if (!dead && !played) {
-            played = true;
-            applyResult(r);
-            break; // Stop checking fallbacks once the primary succeeds
-          }
-        } catch (e) {
-          // Promise rejected (provider failed), loop continues to next fallback
-        }
+      for(const prov of ALL_PROVIDERS){
+        try{
+          const r=await promises[prov];
+          if(!cancelled){const src0=r.sources[0];playSource(src0.url,src0.type||'hls',prov,src0);}
+          return;
+        }catch{}
       }
-      
-      if (!played && !dead) {
-        setErr("All providers failed to load");
-        setSrc(null);
-        setLoading(false);
-      }
-    }
-    go();
-    return()=>{dead=true;};
-  },[type,id,season,episode,applyResult]);
-
-  // Switch to a specific source object (url+type+label+provider)
-  const switchSource=useCallback((source,prov)=>{
-    setShowMenu(false);setErr(null);
-    setSwitchMsg(`Switching…`);
-    setLoading(true); // cleared by MANIFEST_PARSED / loadedmetadata
-    setSrc(source.url);setSrcType(source.type||"hls");
-    setActiveProv(prov);setActiveSource(source);
-    setActiveSub(null);
-  },[]);
-
-  // Switch provider — fetches if not yet loaded or expired (15m TTL), else uses cached first source
-  const switchProvider=useCallback(async(prov)=>{
-    setShowMenu(false);setErr(null);
-    const cached=allSources[prov];
-    const isExpired = !cached || !cached.ts || (Date.now() - cached.ts > 15 * 60 * 1000);
-    
-    if(!isExpired && cached.sources?.length){
-      switchSource(cached.sources[0],prov);return;
-    }
-    setSwitchMsg(`Switching to ${prov}…`);
-    setLoading(true);
-    try{
-      const r=await FETCHERS[prov](type,id,season,episode);
-      setAllSources(prev=>({...prev,[prov]:{ sources: r.sources, ts: Date.now() }}));
-      applyResult(r); // loading cleared by HLS/video events
-    }catch(e){setErr(e.message);setSwitchMsg(null);setLoading(false);}
-  },[type,id,season,episode,applyResult,allSources,switchSource]);
-
-  // Click handler for menu items — handles dub selection and expiry refresh
-  const handleServerClick=useCallback(async(srv,source)=>{
-    setShowMenu(false);
-    const cached=allSources[srv.provider];
-    const isExpired = !cached || !cached.ts || (Date.now() - cached.ts > 15 * 60 * 1000);
-
-    if(!isExpired){
-      switchSource(source,srv.provider);return;
-    }
-
-    setErr(null);setSwitchMsg(`Refreshing ${srv.provider}…`);setLoading(true);
-    try{
-      const r=await FETCHERS[srv.provider](type,id,season,episode);
-      setAllSources(prev=>({...prev,[srv.provider]:{ sources: r.sources, ts: Date.now() }}));
-      let newSource=r.sources[0];
-      if(srv.dub!==null){
-        newSource=r.sources.find(s=>srv.dub.some(d=>(s.dub||"Original").toLowerCase().includes(d.toLowerCase()))) || r.sources[0];
-      }
-      switchSource(newSource,srv.provider);
-    }catch(e){setErr(e.message);setSwitchMsg(null);setLoading(false);}
-  },[type,id,season,episode,allSources,switchSource]);
-
-  // HLS setup — guard: only fires when BOTH src AND srcType are set
-  useEffect(()=>{
-    const v=videoRef.current;if(!v||!src||!srcType)return;
-    // ── Flush stale MSE state before any new source ──────────────────────────
-    // HLS.js destroy() doesn't synchronously detach MSE SourceBuffers.
-    // Without this reset, new HLS instances inherit corrupt codec state from
-    // the previous stream → bufferAddCodecError on every provider switch.
-    if(hlsRef.current){hlsRef.current.destroy();hlsRef.current=null;}
-    v.pause();
-    v.removeAttribute('src');
-    v.load(); // fully resets HTMLVideoElement & detaches all MSE SourceBuffers
-    setHlsLevels([]);setHlsCurrentLevel(-1);
-    if(srcType==="hls"&&Hls.isSupported()){
-      const h=new Hls({
-        enableWorker:true,
-        backBufferLength:60,
-        maxBufferLength:30,
-        startLevel:-1,              // auto — let HLS.js pick best quality by bandwidth
-        levelLoadingTimeOut:15000,
-        fragLoadingTimeOut:20000,
-        levelLoadingMaxRetry:3,
-        fragLoadingMaxRetry:3,
-        stretchShortVideoTrack:true,
-        maxAudioFramesDrift:1.5,
-      });
-      h.on(Hls.Events.ERROR,(_,d)=>{
-        if(d.fatal){
-          console.warn('[VidzenPlayer] HLS fatal:',d.type,d.details,'url:',d.url||src);
-          if(d.type===Hls.ErrorTypes.MEDIA_ERROR && d.details !== "bufferAddCodecError"){
-            console.warn('[VidzenPlayer] Attempting media error recovery...');
-            if(!h.recovered){
-              h.recovered=true;h.recoverMediaError();
-            }else if(!h.swapped){
-              h.swapped=true;h.swapAudioCodec();h.recoverMediaError();
-            }else{
-              hlsRef.current?.destroy();hlsRef.current=null;
-              autoFallback(activeProv);
-            }
-            return;
-          }
-          hlsRef.current?.destroy();hlsRef.current=null;
-          autoFallback(activeProv);
-        }else{
-          // Non-fatal, but handle specific stalls to prevent infinite looping
-          if(d.details===Hls.ErrorDetails.BUFFER_STALLED_ERROR){
-            console.warn('[VidzenPlayer] Buffer stalled, nudging playhead...');
-            v.currentTime += 0.1; // jump the gap
-          }
-        }
-      });
-      h.on(Hls.Events.MANIFEST_PARSED,(_,data)=>{
-        console.log('[VidzenPlayer] Manifest OK, levels:',data.levels.length,'src:',src.slice(0,80));
-        setHlsLevels(data.levels);
-        setHlsCurrentLevel(-1);
-        setLoading(false);setSwitchMsg(null);
-        setNeedsPlay(false);
-      });
-      h.on(Hls.Events.LEVEL_SWITCHED,(_,data)=>setHlsCurrentLevel(data.level));
-      console.log('[VidzenPlayer] loadSource:',src.slice(0,100));
-      h.loadSource(src);h.attachMedia(v);hlsRef.current=h;
-    }else{
-      // MP4 / native video (moviebox)
-      let isCancelled = false;
-
-      // ── Critical: flush any leftover HLS/MSE state from previous provider ──
-      // HLS.js destroy() is not fully synchronous — the video element may still
-      // have MSE SourceBuffers attached when we assign the new plain MP4 src,
-      // causing a "Format error" on the first switch. Explicitly resetting the
-      // element forces the browser to fully tear down before we load the new src.
-      v.pause();
-      v.removeAttribute('src');
-      v.load(); // resets HTMLVideoElement internal state & flushes MSE buffers
-
-      setLoading(false);
-      setSwitchMsg(null);
-      setNeedsPlay(false);
-
-      const onErr = () => {
-        if (isCancelled || !v.src) return;
-        const errMsg = v.error?.message || 'code:' + v.error?.code;
-        console.warn('[VidzenPlayer] MP4 load error:', errMsg);
-        // Try next source within this provider before bailing to next provider
-        const provSources = allSources[activeProv]?.sources || [];
-        const currentIdx = provSources.findIndex(s => s.url === src);
-        const nextSrc = provSources[currentIdx + 1];
-        if (nextSrc && nextSrc.type === 'mp4') {
-          console.warn('[VidzenPlayer] Trying next MP4 source within provider...');
-          isCancelled = true; // prevent double-fire
-          setSrc(nextSrc.url);
-          setSrcType('mp4');
-          setActiveSource(nextSrc);
-        } else {
-          autoFallback(activeProv);
-        }
-      };
-
-      v.addEventListener('error', onErr);
-
-      // Longer tick — MSE teardown can take >50ms across browser implementations
-      setTimeout(() => {
-        if (isCancelled) return;
-        v.src = src;
-        v.load();
-      }, 150);
-
-      // Track cleanup for MP4 listeners so they don't leak on rapid switches
-      var mp4Cleanup = () => {
-        isCancelled = true;
-        v.removeEventListener('error', onErr);
-      };
-    }
-    const key=`${type}-${id}${season?`-s${season}e${episode}`:""}`;
-    getProgress(key).then(prog=>{if(prog?.watched>5){const fn=()=>{v.currentTime=prog.watched;v.removeEventListener("loadedmetadata",fn);};v.addEventListener("loadedmetadata",fn);}});
-    return()=>{
-      if(hlsRef.current){hlsRef.current.destroy();hlsRef.current=null;}
-      if(typeof mp4Cleanup === 'function') mp4Cleanup();
+      if(!cancelled){setErr('All providers failed');setLoading(false);}
     };
-  },[src,srcType]);
+    go();
+    return()=>{cancelled=true;if(loadJobRef.current)loadJobRef.current.cancelled=true;};
+  },[type,id,season,episode,playSource]);
+
+  const handleServerClick=useCallback(async(srv)=>{
+    setShowMenu(false);setErr(null);
+    const tsOk=allSources[srv.provider]?.ts&&(Date.now()-allSources[srv.provider].ts<15*60*1000);
+    let sources=(tsOk&&provCacheRef.current[srv.provider]?.length)?provCacheRef.current[srv.provider]:null;
+    if(!sources){
+      setSwitchMsg(`Loading ${srv.name}…`);setLoading(true);
+      try{
+        const r=await FETCHERS[srv.provider](type,id,season,episode);
+        sources=r.sources;provCacheRef.current[srv.provider]=sources;
+        setAllSources(prev=>({...prev,[srv.provider]:{sources,ts:Date.now()}}));
+      }catch(e){setErr(e.message);setLoading(false);setSwitchMsg(null);return;}
+    }
+    let src0=sources[0];
+    if(srv.dub!==null)src0=sources.find(s=>srv.dub.some(d=>(s.dub||'Original').toLowerCase().includes(d.toLowerCase())))||sources[0];
+    failedRef.current=new Set();
+    setSwitchMsg(`Switching to ${srv.name}…`);setLoading(true);
+    playSource(src0.url,src0.type||'hls',srv.provider,src0);
+  },[type,id,season,episode,allSources,playSource]);
+
+  const switchSource=useCallback((source,prov)=>{
+    setShowSettings(false);setSwitchMsg('Switching…');setLoading(true);
+    playSource(source.url,source.type||'hls',prov,source);
+  },[playSource]);
+
+  useEffect(()=>{
+    const v=videoRef.current;if(!v||srcType!=='hls')return;
+    const key=`${type}-${id}${season?`-s${season}e${episode}`:''}`;
+    const fn=()=>{getProgress(key).then(prog=>{if(prog?.watched>5)v.currentTime=prog.watched;});v.removeEventListener('loadedmetadata',fn);};
+    v.addEventListener('loadedmetadata',fn);
+    return()=>v.removeEventListener('loadedmetadata',fn);
+  },[srcType,type,id,season,episode]);
+
+
 
   // Video events
   useEffect(()=>{
@@ -559,10 +466,9 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
               const isActive=available&&activeSource?.url===source?.url;
               return(
                 <button key={srv.id}
-                  onClick={()=>available&&source&&handleServerClick(srv,source)}
-                  disabled={!available}
-                  style={{width:"100%",textAlign:"left",padding:"10px 10px",color:available?"#fff":"rgba(255,255,255,0.28)",background:isActive?"rgba(255,255,255,0.08)":"transparent",border:"none",borderRadius:12,cursor:available?"pointer":"default",display:"flex",alignItems:"center",gap:10,marginBottom:2,transition:"background 0.15s"}}
-                  onMouseEnter={e=>{if(available&&!isActive)e.currentTarget.style.background="rgba(255,255,255,0.05)";}}
+                  onClick={()=>handleServerClick(srv)}
+                  style={{width:"100%",textAlign:"left",padding:"10px 10px",color:isActive?"#60a5fa":available?"#fff":"rgba(255,255,255,0.5)",background:isActive?"rgba(59,130,246,0.15)":"transparent",border:"none",borderRadius:12,cursor:"pointer",display:"flex",alignItems:"center",gap:10,marginBottom:2,transition:"background 0.15s"}}
+                  onMouseEnter={e=>{if(!isActive)e.currentTarget.style.background="rgba(255,255,255,0.05)";}}
                   onMouseLeave={e=>{if(!isActive)e.currentTarget.style.background="transparent";}}>
                   {/* Flag image — flagcdn.com works on all platforms incl. Windows */}
                   <img src={`https://flagcdn.com/20x15/${srv.cc}.png`} width="20" height="15"
@@ -642,7 +548,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
                     {[
                       ["speed","Playback Speed",speed+"x"],
                       ...(hlsLevels.length>0?[["quality","Quality",hlsCurrentLevel===-1?"Auto":(hlsLevels[hlsCurrentLevel]?.height?hlsLevels[hlsCurrentLevel].height+"p":"Auto")]]:[] ),
-                      ...(srcType==="mp4"&&(allSources[activeProv]?.length||0)>1?[["mpquality","Quality",activeSource?.quality?`${activeSource.quality}p`:"Default"]]:[] ),
+                      ...(srcType==="mp4"&&(allSources[activeProv]?.sources?.length||0)>1?[["mpquality","Quality",activeSource?.quality?`${activeSource.quality}p`:"Default"]]:[] ),
                       ["captions","Captions",activeSub?"On":"Off"]
                     ].map(([k,label,val])=>(
                       <button key={k} onClick={()=>setSettSect(k)} style={{width:"100%",display:"flex",justifyContent:"space-between",alignItems:"center",padding:"10px 12px",background:"transparent",border:"none",color:"rgba(255,255,255,0.8)",cursor:"pointer",borderRadius:8,fontSize:14}}
@@ -664,7 +570,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
                       <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2"><path strokeLinecap="round" strokeLinejoin="round" d="M15 19l-7-7 7-7"/></svg>Back
                     </button>
                     <div style={{borderTop:"1px solid rgba(255,255,255,0.1)",paddingTop:8}}>
-                      {(allSources[activeProv]||[]).filter(s=>!activeSource?.dub||s.dub===activeSource.dub).map((s,i)=>{
+                      {(allSources[activeProv]?.sources||[]).filter(s=>!activeSource?.dub||s.dub===activeSource.dub).map((s,i)=>{
                         const isAct=activeSource?.url===s.url;
                         return<button key={i} onClick={()=>{switchSource(s,activeProv);setShowSettings(false);}}
                           style={{width:"100%",textAlign:"left",padding:"8px 12px",background:isAct?"rgba(59,130,246,0.3)":"transparent",border:"none",color:isAct?"#60a5fa":"rgba(255,255,255,0.7)",cursor:"pointer",borderRadius:8,fontSize:13}}>
