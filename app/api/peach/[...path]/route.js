@@ -68,17 +68,10 @@ async function doFetch(targetUrl, request) {
             const data = JSON.parse(body);
             if (data?.sources && Array.isArray(data.sources)) {
                 let rewritten = false;
-                const originalLength = data.sources.length;
 
                 const validSources = (await Promise.all(data.sources.map(async src => {
                     if (!src.url || src.type !== "mp4") { delete src.headers; return src; }
 
-                    // Validate MP4 Codec (Reject HEVC/Dolby Vision)
-                    const isHevc = await isHevcMp4(src);
-                    if (isHevc) {
-                        console.log(`[peach] Rejected HEVC MP4 source: ${src.url.substring(0, 70)}...`);
-                        return null; // Remove this source
-                    }
 
                     // Case 1: Backend internal mp4-proxy URL → replace host with CF worker
                     const isInternalProxy = /^https?:\/\/(?:localhost|127\.0\.0\.1):\d+\//.test(src.url)
@@ -137,11 +130,6 @@ async function doFetch(targetUrl, request) {
                     return src;
                 }))).filter(Boolean);
 
-                // If we rejected ALL mp4 sources due to HEVC, return 404 to trigger fallback
-                if (originalLength > 0 && validSources.length === 0) {
-                    return { status: 404, body: JSON.stringify({ error: "MB_NO_SOURCES" }), headers: resHeaders };
-                }
-
                 data.sources = validSources;
                 if (rewritten) resHeaders["Cache-Control"] = "no-store";
                 return { status: upstream.status, body: JSON.stringify(data), headers: resHeaders };
@@ -156,42 +144,4 @@ export async function OPTIONS() {
     return new Response(null, { headers: { "Access-Control-Allow-Origin": "*", "Access-Control-Allow-Methods": "GET, OPTIONS", "Access-Control-Allow-Headers": "*" } });
 }
 
-async function isHevcMp4(src) {
-    // We must fetch through the INTERNAL proxy (localhost) so CDN auth headers
-    // (Origin, Referer) are applied correctly. DO NOT extract the raw CDN url.
-    let probeUrl = src.url;
-    let extraHeaders = {};
 
-    // For raw CDN urls (Case 2 - not yet routed through proxy), pull the headers
-    // the backend gave us so we can spoof the CDN auth.
-    if (src.headers && !/^https?:\/\/(?:localhost|127\.0\.0\.1):\d+\//.test(probeUrl)) {
-        try {
-            extraHeaders = typeof src.headers === 'string' ? JSON.parse(src.headers) : src.headers;
-        } catch { }
-    }
-
-    try {
-        const fetchHeaders = {
-            ...extraHeaders,
-            "Range": "bytes=0-8191",
-            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        };
-        console.log(`[peach] codec-probe → ${probeUrl.substring(0, 90)}`);
-        const res = await fetch(probeUrl, { headers: fetchHeaders, signal: AbortSignal.timeout(5000) });
-        console.log(`[peach] codec-probe status: ${res.status} / ${res.headers.get("content-type")}`);
-
-        if (!res.ok && res.status !== 206) {
-            console.log(`[peach] codec-probe non-OK, failing open (assuming H.264)`);
-            return false;
-        }
-
-        const buffer = await res.arrayBuffer();
-        const text = new TextDecoder("ascii", { fatal: false }).decode(new Uint8Array(buffer, 0, Math.min(buffer.byteLength, 512)));
-        const isHevc = text.includes("hvc1") || text.includes("hev1") || text.includes("dvhe") || text.includes("dvh1");
-        console.log(`[peach] codec-probe result → isHEVC=${isHevc} (scanned ${buffer.byteLength} bytes)`);
-        return isHevc;
-    } catch (e) {
-        console.log(`[peach] codec-probe EXCEPTION: ${e.message}`);
-        return false;
-    }
-}

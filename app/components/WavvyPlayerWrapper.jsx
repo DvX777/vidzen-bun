@@ -350,18 +350,31 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
 
       const onErr = () => {
         if (isCancelled || !v.src) return;
-        console.warn('[VidzenPlayer] MP4 load error:', v.error?.message || 'code:' + v.error?.code);
-        autoFallback(activeProv);
+        const errMsg = v.error?.message || 'code:' + v.error?.code;
+        console.warn('[VidzenPlayer] MP4 load error:', errMsg);
+        // Try next source within this provider before bailing to next provider
+        const provSources = allSources[activeProv]?.sources || [];
+        const currentIdx = provSources.findIndex(s => s.url === src);
+        const nextSrc = provSources[currentIdx + 1];
+        if (nextSrc && nextSrc.type === 'mp4') {
+          console.warn('[VidzenPlayer] Trying next MP4 source within provider...');
+          isCancelled = true; // prevent double-fire
+          setSrc(nextSrc.url);
+          setSrcType('mp4');
+          setActiveSource(nextSrc);
+        } else {
+          autoFallback(activeProv);
+        }
       };
 
       v.addEventListener('error', onErr);
 
-      // Small tick to ensure MSE teardown is complete before assigning new src
+      // Longer tick — MSE teardown can take >50ms across browser implementations
       setTimeout(() => {
         if (isCancelled) return;
         v.src = src;
         v.load();
-      }, 50);
+      }, 150);
 
       // Track cleanup for MP4 listeners so they don't leak on rapid switches
       var mp4Cleanup = () => {
