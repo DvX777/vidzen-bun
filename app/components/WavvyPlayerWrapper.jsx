@@ -109,6 +109,8 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   const provCacheRef=useRef({});
   const failedRef=useRef(new Set());
   const activeProvRef=useRef(null);
+  const mediaRef=useRef({type,id,season,episode});
+  useEffect(()=>{mediaRef.current={type,id,season,episode};},[type,id,season,episode]);
 
   // ── UI State ──────────────────────────────────────────────────────────────
   const [loading,setLoading]=useState(true);
@@ -206,7 +208,8 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         };
         v.addEventListener('error',onErr,{once:true});
         v.addEventListener('loadedmetadata',onReady,{once:true});
-        const key=`${type}-${id}${season?`-s${season}e${episode}`:''}`;
+        const {type:mt,id:mi,season:ms,episode:me}=mediaRef.current;
+        const key=`${mt}-${mi}${ms?`-s${ms}e${me}`:''}`;
         getProgress(key).then(prog=>{if(prog?.watched>5){const fn=()=>{v.currentTime=prog.watched;v.removeEventListener('loadedmetadata',fn);};v.addEventListener('loadedmetadata',fn);}});
         v.src=url;v.load();v.play().catch(()=>{});
       },150);
@@ -215,6 +218,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   },[]);
 
   const autoFallback=useCallback(async()=>{
+    const {type:mt,id:mi,season:ms,episode:me}=mediaRef.current;
     const failed=failedRef.current;
     failed.add(activeProvRef.current);
     for(const prov of ALL_PROVIDERS){
@@ -223,7 +227,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         setSwitchMsg(`Trying ${prov}…`);setLoading(true);
         let sources=provCacheRef.current[prov];
         if(!sources?.length){
-          const r=await FETCHERS[prov](type,id,season,episode);
+          const r=await FETCHERS[prov](mt,mi,ms,me);
           sources=r.sources;provCacheRef.current[prov]=sources;
           setAllSources(prev=>({...prev,[prov]:{sources,ts:Date.now()}}));
         }
@@ -234,7 +238,8 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     }
     setErr('All providers failed — please try again later');
     setLoading(false);setSwitchMsg(null);
-  },[type,id,season,episode,playSource]);
+  },[playSource]);
+
 
   useEffect(()=>{
     failedRef.current=new Set();provCacheRef.current={};activeProvRef.current=null;
