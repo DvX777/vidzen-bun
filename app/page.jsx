@@ -107,7 +107,7 @@ export default function HomePage() {
     return () => window.removeEventListener('scroll', fn)
   }, [])
 
-  const dId  = id  || '666243'
+  const dId  = id  || '786892'
   const dSea = sea || '1'
   const dEp  = ep  || '1'
   const embedUrl = tab === 'movie' ? `/embed/movie/${dId}` : `/embed/tv/${dId}/${dSea}/${dEp}`
@@ -225,7 +225,7 @@ export default function HomePage() {
         </Reveal>
         <Reveal delay={120}>
           <div style={{ display: 'flex', gap: 12, marginBottom: 12, flexWrap: 'wrap' }}>
-            <input value={id} onChange={e => setId(e.target.value)} placeholder={tab === 'movie' ? 'Movie TMDB ID (e.g. 666243)' : 'Show TMDB ID (e.g. 94997)'} style={{ flex: 2, minWidth: 200 }} />
+            <input value={id} onChange={e => setId(e.target.value)} placeholder={tab === 'movie' ? 'Movie TMDB ID (e.g. 786892)' : 'Show TMDB ID (e.g. 94997)'} style={{ flex: 2, minWidth: 200 }} />
             {tab === 'tv' && <>
               <input value={sea} onChange={e => setSea(e.target.value)} placeholder="Season" style={{ flex: '0 0 100px' }} />
               <input value={ep}  onChange={e => setEp(e.target.value)}  placeholder="Episode" style={{ flex: '0 0 100px' }} />
@@ -258,7 +258,7 @@ export default function HomePage() {
         </Reveal>
         <div style={{ display: 'grid', gridTemplateColumns: 'repeat(auto-fit,minmax(340px,1fr))', gap: 20 }}>
           {[
-            { badge: 'Movie', color: '#ec4899', title: 'Embed Movie', desc: 'Use the TMDB movie ID to embed any film.', endpoint: 'https://vidzen.fun/embed/movie/[TMDB_ID]', example: '<iframe src="https://vidzen.fun/embed/movie/666243" frameBorder="0" allowFullScreen></iframe>' },
+            { badge: 'Movie', color: '#ec4899', title: 'Embed Movie', desc: 'Use the TMDB movie ID to embed any film.', endpoint: 'https://vidzen.fun/embed/movie/[TMDB_ID]', example: '<iframe src="https://vidzen.fun/embed/movie/786892" frameBorder="0" allowFullScreen></iframe>' },
             { badge: 'TV', color: '#8b5cf6', title: 'Embed TV Show', desc: 'Specify TMDB ID, season, and episode number.', endpoint: 'https://vidzen.fun/embed/tv/[TMDB_ID]/[SEASON]/[EPISODE]', example: '<iframe src="https://vidzen.fun/embed/tv/94997/1/1" frameBorder="0" allowFullScreen></iframe>' },
           ].map((doc, i) => (
             <Reveal key={i} delay={i * 80}>
