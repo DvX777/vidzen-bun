@@ -274,7 +274,14 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   // HLS setup — guard: only fires when BOTH src AND srcType are set
   useEffect(()=>{
     const v=videoRef.current;if(!v||!src||!srcType)return;
+    // ── Flush stale MSE state before any new source ──────────────────────────
+    // HLS.js destroy() doesn't synchronously detach MSE SourceBuffers.
+    // Without this reset, new HLS instances inherit corrupt codec state from
+    // the previous stream → bufferAddCodecError on every provider switch.
     if(hlsRef.current){hlsRef.current.destroy();hlsRef.current=null;}
+    v.pause();
+    v.removeAttribute('src');
+    v.load(); // fully resets HTMLVideoElement & detaches all MSE SourceBuffers
     setHlsLevels([]);setHlsCurrentLevel(-1);
     if(srcType==="hls"&&Hls.isSupported()){
       const h=new Hls({

@@ -11,9 +11,27 @@ export async function GET(request) {
   const id = searchParams.get("id");
   if (!id) return jsonResponse({ error: "Missing ?id= param" }, 400);
 
-  const params = new URLSearchParams({ id });
   const season = searchParams.get("season");
   const episode = searchParams.get("episode");
+  const mediaType = (season && episode) ? "tv" : "movie";
+
+  // Wyzie requires IMDB IDs (tt-format). Convert TMDB ID → IMDB ID first.
+  const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
+  let wyzieLookupId = id;
+  try {
+    const extRes = await fetch(
+      `https://api.themoviedb.org/3/${mediaType}/${id}/external_ids?api_key=${TMDB_KEY}`,
+      { headers: { Accept: "application/json" } }
+    );
+    if (extRes.ok) {
+      const extData = await extRes.json();
+      if (extData.imdb_id) {
+        wyzieLookupId = extData.imdb_id; // e.g. "tt1234567"
+      }
+    }
+  } catch { /* fall through with TMDB id */ }
+
+  const params = new URLSearchParams({ id: wyzieLookupId });
   if (season && episode) { params.set("season", season); params.set("episode", episode); }
   params.set("key", WYZIE_KEY);
 
