@@ -5,8 +5,8 @@ import { updateProgress, getProgress } from "../lib/crypto";
 
 const PEACH_API = "/api/peach";
 const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
-// Provider order: moviebox first (fastest, most reliable after fix), then videasy, then piexe fallback
-const ALL_PROVIDERS=["moviebox","videasy","piexe"];
+// Provider order: videasy first (primary), then moviebox, then piexe fallback
+const ALL_PROVIDERS=["videasy","moviebox","piexe"];
 const PCOL={"piexe":"#f59e0b","moviebox":"#10b981","videasy":"#8b5cf6"};
 const fmt=(t)=>{if(!isFinite(t)||isNaN(t))return"0:00";const s=Math.floor(t%60),m=Math.floor((t/60)%60),h=Math.floor(t/3600);const p=n=>String(n).padStart(2,"0");return h?`${h}:${p(m)}:${p(s)}`:`${m}:${p(s)}`;}
 
@@ -40,8 +40,8 @@ const FETCHERS={moviebox:fetchMoviebox,videasy:fetchVideasy,piexe:fetchPiexe};
 
 // ── Server definitions — each maps to a dub/provider combination ──────────────────
 const SERVERS=[
-  {id:"en-mb",cc:"us",name:"Orbit",  provider:"moviebox",dub:["English","Original"],dubLabel:"Original audio"},
   {id:"en-vd",cc:"gb",name:"Hexa",   provider:"videasy", dub:null,              dubLabel:"Original audio"},
+  {id:"en-mb",cc:"us",name:"Orbit",  provider:"moviebox",dub:["English","Original"],dubLabel:"Original audio"},
   {id:"hi-px",cc:"in",name:"Delta",  provider:"piexe",   dub:null,              dubLabel:"Hindi audio"},
   {id:"hi-mb",cc:"in",name:"Flux",   provider:"moviebox",dub:["Hindi"],          dubLabel:"Hindi audio"},
   {id:"fr-mb",cc:"fr",name:"Gama",   provider:"moviebox",dub:["French"],         dubLabel:"French audio"},
@@ -132,6 +132,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   const [switchMsg,setSwitchMsg]=useState(null);
   const [hlsLevels,setHlsLevels]=useState([]);
   const [hlsCurrentLevel,setHlsCurrentLevel]=useState(-1);
+  const [needsPlay,setNeedsPlay]=useState(false);
 
   // TMDB poster
   useEffect(()=>{
@@ -173,26 +174,34 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     const go=async()=>{
       setSrc(null);setSrcType(null);setLoading(true);setErr(null);setCues([]);setSwitchMsg(null);
       setIsPlaying(false);setCur(0);setDur(0);setBuf(0);
-      // Fire all fetches concurrently in the background
-      const fetchPromises = ALL_PROVIDERS.map(async (prov) => {
-        const r = await FETCHERS[prov](type, id, season, episode);
-        if (!dead) setAllSources(prev => ({ ...prev, [prov]: { sources: r.sources, ts: Date.now() } }));
-        return r; // Resolves with the successful result
+      // Start all fetches concurrently in the background so the menu is populated instantly
+      const fetchPromises = {};
+      ALL_PROVIDERS.forEach((prov) => {
+        fetchPromises[prov] = FETCHERS[prov](type, id, season, episode).then(r => {
+          if (!dead) setAllSources(prev => ({ ...prev, [prov]: { sources: r.sources, ts: Date.now() } }));
+          return r;
+        });
       });
 
-      try {
-        // Play the VERY FIRST provider that successfully fetches (fastest wins)
-        const fastestResult = await Promise.any(fetchPromises);
-        if (!dead) {
-          applyResult(fastestResult);
+      // Await them in exact priority order (Videasy -> Moviebox -> Piexe)
+      let played = false;
+      for (const prov of ALL_PROVIDERS) {
+        try {
+          const r = await fetchPromises[prov];
+          if (!dead && !played) {
+            played = true;
+            applyResult(r);
+            break; // Stop checking fallbacks once the primary succeeds
+          }
+        } catch (e) {
+          // Promise rejected (provider failed), loop continues to next fallback
         }
-      } catch (e) {
-        // Promise.any throws AggregateError if ALL promises reject
-        if (!dead) {
-          setErr("All providers failed to load");
-          setSrc(null);
-          setLoading(false);
-        }
+      }
+      
+      if (!played && !dead) {
+        setErr("All providers failed to load");
+        setSrc(null);
+        setLoading(false);
       }
     }
     go();
@@ -283,12 +292,17 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         setHlsLevels(data.levels);
         setHlsCurrentLevel(-1);
         setLoading(false);setSwitchMsg(null);
-        // Mute → play → unmute: bypasses browser autoplay policy when switching providers.
-        // User already interacted (clicked switch) but browser may still block auto-resume.
-        const wasMuted=v.muted;
-        v.muted=true;
-        v.play().then(()=>{if(!wasMuted)v.muted=false;})
-               .catch(e=>{if(e.name!=="AbortError")console.warn('[VidzenPlayer] play():',e.message);v.muted=wasMuted;});
+        setNeedsPlay(false);
+        // Play directly. If user interacted with the page, it works with sound.
+        const playPromise = v.play();
+        if (playPromise !== undefined) {
+          playPromise.catch(e => {
+            if (e.name !== "AbortError") {
+              console.warn('[VidzenPlayer] HLS autoplay blocked:', e.message);
+              setNeedsPlay(true);
+            }
+          });
+        }
       });
       h.on(Hls.Events.LEVEL_SWITCHED,(_,data)=>setHlsCurrentLevel(data.level));
       console.log('[VidzenPlayer] loadSource:',src.slice(0,100));
@@ -300,15 +314,15 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         if (isCancelled || v.networkState === 3 /* NETWORK_NO_SOURCE */) return;
         setLoading(false);
         setSwitchMsg(null);
-        // Try autoplay using the mute trick to bypass strict browser policies
-        const wasMuted = v.muted;
-        v.muted = true;
+        setNeedsPlay(false);
+        // Play directly. If user interacted with the page, it works with sound.
         const playPromise = v.play();
         if (playPromise !== undefined) {
-          playPromise.then(() => { if (!wasMuted) v.muted = false; })
-          .catch(e => {
-            if (e.name !== "AbortError") console.warn('[VidzenPlayer] MP4 autoplay blocked:', e.message);
-            v.muted = wasMuted;
+          playPromise.catch(e => {
+            if (e.name !== "AbortError") {
+              console.warn('[VidzenPlayer] MP4 autoplay blocked:', e.message);
+              setNeedsPlay(true);
+            }
           });
         }
       };
@@ -432,14 +446,14 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
       onMouseMove={resetHide} onTouchStart={resetHide} onClick={()=>{setShowSettings(false);setShowMenu(false);}}>
       <style>{`.wv-r{-webkit-appearance:none;appearance:none;background:transparent;cursor:pointer;width:100%;height:24px;}.wv-r::-webkit-slider-thumb{-webkit-appearance:none;width:0;height:0;}.wv-r::-moz-range-thumb{border:none;width:0;height:0;}@keyframes wvspin{to{transform:rotate(360deg);}}`}</style>
 
-      {loading&&<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,background:"#000"}}>
+      {loading&&<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,background:"#000",zIndex:50}}>
         <RoseCurveSpinner size={72}/>
         <p style={{color:"rgba(255,255,255,0.5)",fontSize:13,fontFamily:"system-ui,sans-serif",textAlign:"center",maxWidth:280,lineHeight:1.5,marginTop:4}}>
           {switchMsg||"Loading…"}
         </p>
       </div>}
 
-      {!loading&&err&&<div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"#000"}}>
+      {!loading&&err&&<div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"#000",zIndex:50}}>
         <div style={{textAlign:"center",color:"#fff",fontFamily:"system-ui,sans-serif"}}>
           <div style={{fontSize:36,marginBottom:12}}>⚠️</div>
           <div style={{fontSize:15,color:"rgba(255,255,255,0.7)",marginBottom:6}}>{err}</div>
@@ -447,9 +461,16 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         </div>
       </div>}
 
-      <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"contain",display:"block",background:"#000"}}
+      <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"contain",display:"block",background:"#000",opacity:loading?0:1,transition:"opacity 0.2s"}}
         playsInline preload="metadata" poster={poster||undefined} type={srcType === "mp4" ? "video/mp4" : undefined}
-        onClick={e=>{e.stopPropagation();togglePlay();}} onDoubleClick={togFs} suppressHydrationWarning/>
+        onClick={e=>{e.stopPropagation();if(needsPlay){setNeedsPlay(false);}togglePlay();}} onDoubleClick={togFs} suppressHydrationWarning/>
+
+      {needsPlay && !loading && !err && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.4)",zIndex:40,pointerEvents:"none"}}>
+        <div style={{width:80,height:80,borderRadius:"50%",background:"rgba(59,130,246,0.9)",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 10px 25px rgba(0,0,0,0.5)",pointerEvents:"auto",cursor:"pointer"}}
+             onClick={(e)=>{e.stopPropagation();setNeedsPlay(false);togglePlay();}}>
+          <svg width="36" height="36" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+        </div>
+      </div>}
 
       {activeCue&&<div style={{position:"absolute",bottom:100,left:0,right:0,textAlign:"center",pointerEvents:"none"}}>
         <span style={{background:"rgba(0,0,0,0.78)",color:"#fff",padding:"4px 14px",borderRadius:4,fontSize:16,fontFamily:"system-ui,sans-serif"}}>{activeCue.text}</span>

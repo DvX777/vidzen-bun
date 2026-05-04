@@ -111,9 +111,12 @@ export async function GET(request) {
     const meta = await getTmdbMeta(tmdbId, type);
     const streamUrl = await fetchYoruStream(tmdbId, type, meta, season, ep);
 
-    // Encrypt the Yoru CF worker URL into a server token.
-    // Network tab shows /api/proxy?t=TOKEN — Yoru URL hidden.
-    const proxied = await proxyToken(streamUrl);
+    // Encrypt the Yoru CF worker URL into a server token with spoofed headers.
+    // The Videasy CDN requires these headers to bypass hotlink protection.
+    const proxied = await proxyToken(streamUrl, { 
+      origin: "https://videasy.net", 
+      referer: "https://videasy.net/" 
+    });
     return Response.json({
       sources: [{
         url: proxied,
