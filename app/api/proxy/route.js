@@ -29,23 +29,69 @@ async function rewriteM3U8(body, baseUrl, origin, referer) {
   // Chrome's MSE (via HLS.js) only supports H.264/AVC. Yoru CDN sometimes serves
   // HEVC (hvc1/hev1) variants which cause bufferAddCodecError.
   // Remove them here before HLS.js parses the manifest.
-  let processedBody = body;
-  if (body.includes("#EXT-X-STREAM-INF")) {
-    const rawLines = body.split("\n");
-    const kept = [];
-    for (let i = 0; i < rawLines.length; i++) {
-      const t = rawLines[i].trim();
-      if (t.startsWith("#EXT-X-STREAM-INF")) {
-        const codecMatch = t.match(/CODECS="([^"]+)"/);
-        const codecs = codecMatch ? codecMatch[1] : "";
-        const isHevc = /\b(hvc1|hev1|dvh1|dvhe)\b/i.test(codecs);
-        if (isHevc) { i++; continue; } // skip EXT-X-STREAM-INF line + its URL line
+
+  // Enhanced HEVC/HEVC detection - checks more comprehensively
+  function containsHevcCodec(line) {
+    const t = line.trim();
+    if (!t) return false;
+    // Check for HEVC family codecs in CODECS attribute or anywhere in the line
+    return /\b(hvc1|hev1|dvh1|dvhe)\b/i.test(t);
+  }
+
+  // Check if line is a variant stream declaration (EXT-X-STREAM-INF)
+  function isVariantStream(line) {
+    return line.trim().startsWith("#EXT-X-STREAM-INF");
+  }
+
+  // Check if line is an EXT-X-MEDIA entry (audio-only tracks)
+  function isMediaEntry(line) {
+    return line.trim().startsWith("#EXT-X-MEDIA");
+  }
+
+  // Filter HEVC variants from playlist - enhanced version
+  function filterHevcFromPlaylist(lines) {
+    const filtered = [];
+    let i = 0;
+
+    while (i < lines.length) {
+      const line = lines[i];
+      const trimmed = line.trim();
+
+      // Skip EXT-X-STREAM-INF lines that contain HEVC
+      if (isVariantStream(line) && containsHevcCodec(line)) {
+        console.log('[proxy] Filtering HEVC variant:', lines[i + 1]?.trim());
+        i += 2; // Skip this line and the URL line that follows
+        continue;
       }
-      kept.push(rawLines[i]);
+
+      // Skip EXT-X-MEDIA audio tracks with HEVC audio
+      if (isMediaEntry(line) && containsHevcCodec(line)) {
+        console.log('[proxy] Filtering HEVC media:', line.substring(0, 100));
+        i++;
+        continue;
+      }
+
+      filtered.push(line);
+      i++;
     }
-    // Only use filtered version if at least one H.264 variant remains
-    const hasVariant = kept.some(l => l.trim().startsWith("#EXT-X-STREAM-INF"));
-    processedBody = hasVariant ? kept.join("\n") : body;
+
+    return filtered;
+  }
+
+  let processedBody = body;
+  if (body.includes("#EXT-X-STREAM-INF") || body.includes("#EXT-X-MEDIA")) {
+    // First, filter HEVC from the processed body
+    const rawLines = processedBody.split("\n");
+    const filteredLines = filterHevcFromPlaylist(rawLines);
+
+    // Check if any variants remain
+    const hasVariant = filteredLines.some(l => l.trim().startsWith("#EXT-X-STREAM-INF"));
+    if (!hasVariant && rawLines.some(l => l.trim().startsWith("#EXT-X-STREAM-INF"))) {
+      console.log('[proxy] All variants were HEVC, keeping original playlist');
+      // Keep original - fail open rather than return empty playlist
+    } else {
+      processedBody = filteredLines.join("\n");
+    }
   }
 
   const lines = await Promise.all(

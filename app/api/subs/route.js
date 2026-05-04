@@ -1,6 +1,7 @@
 // app/api/subs/route.js — identical to VidMax
 export const runtime = "edge";
 const WYZIE_API = "https://sub.wyzie.ru";
+const WYZIE_KEY = process.env.WYZIE_API_KEY || "wyzie-f65c5237cb2ce01f15317936d8721816";
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
@@ -14,6 +15,7 @@ export async function GET(request) {
   const season = searchParams.get("season");
   const episode = searchParams.get("episode");
   if (season && episode) { params.set("season", season); params.set("episode", episode); }
+  params.set("key", WYZIE_KEY);
 
   try {
     const res = await fetch(`${WYZIE_API}/search?${params}`, { headers: { Accept: "application/json" } });

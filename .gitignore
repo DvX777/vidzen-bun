@@ -27,6 +27,7 @@ npm-debug.log*
 yarn-debug.log*
 yarn-error.log*
 .pnpm-debug.log*
+.claude/
 
 # local env files
 .env*.local
@@ -51,3 +52,4 @@ bun.lockb
 /tests
 /scratch
 .tempmediaStorage
+docs/*

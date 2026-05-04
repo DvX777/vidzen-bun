@@ -315,9 +315,16 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     }else{
       // MP4 / native video (moviebox)
       let isCancelled = false;
-      
-      // Clear loading immediately for MP4 since we don't autoplay. 
-      // The browser will handle metadata loading natively when the user clicks Play.
+
+      // ── Critical: flush any leftover HLS/MSE state from previous provider ──
+      // HLS.js destroy() is not fully synchronous — the video element may still
+      // have MSE SourceBuffers attached when we assign the new plain MP4 src,
+      // causing a "Format error" on the first switch. Explicitly resetting the
+      // element forces the browser to fully tear down before we load the new src.
+      v.pause();
+      v.removeAttribute('src');
+      v.load(); // resets HTMLVideoElement internal state & flushes MSE buffers
+
       setLoading(false);
       setSwitchMsg(null);
       setNeedsPlay(false);
@@ -330,9 +337,12 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
 
       v.addEventListener('error', onErr);
 
-      // Directly set the source and load
-      v.src = src;
-      v.load();
+      // Small tick to ensure MSE teardown is complete before assigning new src
+      setTimeout(() => {
+        if (isCancelled) return;
+        v.src = src;
+        v.load();
+      }, 50);
 
       // Track cleanup for MP4 listeners so they don't leak on rapid switches
       var mp4Cleanup = () => {
