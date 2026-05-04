@@ -2,9 +2,9 @@
   "name": "vidzen",
   "private": true,
   "scripts": {
-    "dev": "bunx next dev",
-    "build": "bunx next build",
-    "start": "bunx next start"
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start"
   },
   "dependencies": {
     "framer-motion": "^12.34.1",
