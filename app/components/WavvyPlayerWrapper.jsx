@@ -142,6 +142,18 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
       .catch(()=>{});
   },[type,id]);
 
+  // Subtitle fetch — calls /api/subs which queries Wyzie and returns VTT-ready URLs
+  useEffect(()=>{
+    if(!id)return;
+    setSubs([]);setActiveSub(null);
+    const params=new URLSearchParams({id});
+    if(season&&episode){params.set('season',season);params.set('episode',episode);}
+    fetch(`/api/subs?${params}`)
+      .then(r=>r.ok?r.json():[])
+      .then(data=>{if(Array.isArray(data)&&data.length>0){setSubs(data);console.log(`[VidzenPlayer] Loaded ${data.length} subtitle track(s)`);}})
+      .catch(()=>{});
+  },[type,id,season,episode]);
+
   // Store all sources from a provider; load first source of the result
   const applyResult=useCallback((result)=>{
     const src0=result.sources[0];
