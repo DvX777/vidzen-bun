@@ -279,7 +279,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         if(d.fatal){
           console.warn('[VidzenPlayer] HLS fatal:',d.type,d.details,'url:',d.url||src);
           // Try soft media recovery before hard fallback
-          if(d.type===Hls.ErrorTypes.MEDIA_ERROR){
+          if(d.type===Hls.ErrorTypes.MEDIA_ERROR && d.details !== "bufferAddCodecError"){
             console.warn('[VidzenPlayer] Attempting media error recovery...');
             h.recoverMediaError();return;
           }
