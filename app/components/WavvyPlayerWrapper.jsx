@@ -20,7 +20,7 @@ async function fetchMoviebox(type,id,season,episode){
     if(b.dub==="English"&&a.dub!=="English")return 1;
     return (b.quality||0)-(a.quality||0);
   });
-  return{provider:"moviebox",sources:sorted.map(s=>({url:s.url,type:s.type||"mp4",dub:s.dub||"Original",quality:s.quality||0,label:[s.quality&&`${s.quality}p`,s.dub&&s.dub!=="Original"?s.dub:null].filter(Boolean).join(" ")||"Default"}))};
+  return{provider:"moviebox",sources:sorted.map(s=>({url:s.url,type:(s.url.includes('.m3u8')?"hls":(s.type||"mp4")),dub:s.dub||"Original",quality:s.quality||0,label:[s.quality&&`${s.quality}p`,s.dub&&s.dub!=="Original"?s.dub:null].filter(Boolean).join(" ")||"Default"}))};
 }
 async function fetchVideasy(type,id,season,episode){
   const p=new URLSearchParams({id,type});
@@ -133,6 +133,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   const [hlsLevels,setHlsLevels]=useState([]);
   const [hlsCurrentLevel,setHlsCurrentLevel]=useState(-1);
   const [needsPlay,setNeedsPlay]=useState(false);
+  const [buffering,setBuffering]=useState(false);
 
   // TMDB poster
   useEffect(()=>{
@@ -263,7 +264,6 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     const v=videoRef.current;if(!v||!src||!srcType)return;
     if(hlsRef.current){hlsRef.current.destroy();hlsRef.current=null;}
     setHlsLevels([]);setHlsCurrentLevel(-1);
-    v.removeAttribute("src");v.load();
     if(srcType==="hls"&&Hls.isSupported()){
       const h=new Hls({
         enableWorker:true,
@@ -274,17 +274,32 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         fragLoadingTimeOut:20000,
         levelLoadingMaxRetry:3,
         fragLoadingMaxRetry:3,
+        stretchShortVideoTrack:true,
+        maxAudioFramesDrift:1.5,
       });
       h.on(Hls.Events.ERROR,(_,d)=>{
         if(d.fatal){
           console.warn('[VidzenPlayer] HLS fatal:',d.type,d.details,'url:',d.url||src);
-          // Try soft media recovery before hard fallback
           if(d.type===Hls.ErrorTypes.MEDIA_ERROR && d.details !== "bufferAddCodecError"){
             console.warn('[VidzenPlayer] Attempting media error recovery...');
-            h.recoverMediaError();return;
+            if(!h.recovered){
+              h.recovered=true;h.recoverMediaError();
+            }else if(!h.swapped){
+              h.swapped=true;h.swapAudioCodec();h.recoverMediaError();
+            }else{
+              hlsRef.current?.destroy();hlsRef.current=null;
+              autoFallback(activeProv);
+            }
+            return;
           }
           hlsRef.current?.destroy();hlsRef.current=null;
           autoFallback(activeProv);
+        }else{
+          // Non-fatal, but handle specific stalls to prevent infinite looping
+          if(d.details===Hls.ErrorDetails.BUFFER_STALLED_ERROR){
+            console.warn('[VidzenPlayer] Buffer stalled, nudging playhead...');
+            v.currentTime += 0.1; // jump the gap
+          }
         }
       });
       h.on(Hls.Events.MANIFEST_PARSED,(_,data)=>{
@@ -293,16 +308,6 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         setHlsCurrentLevel(-1);
         setLoading(false);setSwitchMsg(null);
         setNeedsPlay(false);
-        // Play directly. If user interacted with the page, it works with sound.
-        const playPromise = v.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(e => {
-            if (e.name !== "AbortError") {
-              console.warn('[VidzenPlayer] HLS autoplay blocked:', e.message);
-              setNeedsPlay(true);
-            }
-          });
-        }
       });
       h.on(Hls.Events.LEVEL_SWITCHED,(_,data)=>setHlsCurrentLevel(data.level));
       console.log('[VidzenPlayer] loadSource:',src.slice(0,100));
@@ -310,42 +315,28 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     }else{
       // MP4 / native video (moviebox)
       let isCancelled = false;
-      const onMeta = () => {
-        if (isCancelled || v.networkState === 3 /* NETWORK_NO_SOURCE */) return;
-        setLoading(false);
-        setSwitchMsg(null);
-        setNeedsPlay(false);
-        // Play directly. If user interacted with the page, it works with sound.
-        const playPromise = v.play();
-        if (playPromise !== undefined) {
-          playPromise.catch(e => {
-            if (e.name !== "AbortError") {
-              console.warn('[VidzenPlayer] MP4 autoplay blocked:', e.message);
-              setNeedsPlay(true);
-            }
-          });
-        }
-      };
       
+      // Clear loading immediately for MP4 since we don't autoplay. 
+      // The browser will handle metadata loading natively when the user clicks Play.
+      setLoading(false);
+      setSwitchMsg(null);
+      setNeedsPlay(false);
+
       const onErr = () => {
-        // Ignore errors if cancelled or if the browser simply complains about no source
-        if (isCancelled || v.networkState === 3 /* NETWORK_NO_SOURCE */ || !v.src) return;
+        if (isCancelled || !v.src) return;
         console.warn('[VidzenPlayer] MP4 load error:', v.error?.message || 'code:' + v.error?.code);
-        setErr('Video failed to load');
-        setLoading(false);
+        autoFallback(activeProv);
       };
 
-      v.addEventListener('loadedmetadata', onMeta);
       v.addEventListener('error', onErr);
 
-      // Directly set the source and load (no timeout, no race condition)
+      // Directly set the source and load
       v.src = src;
       v.load();
 
       // Track cleanup for MP4 listeners so they don't leak on rapid switches
       var mp4Cleanup = () => {
         isCancelled = true;
-        v.removeEventListener('loadedmetadata', onMeta);
         v.removeEventListener('error', onErr);
       };
     }
@@ -365,13 +356,18 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     const onPl=()=>setIsPlaying(true);
     const onPa=()=>setIsPlaying(false);
     const onV=()=>{setVol(v.volume);setMuted(v.muted);};
+    const onWait=()=>setBuffering(true);
+    const onPlayg=()=>setBuffering(false);
+    const onCanPl=()=>setBuffering(false);
     v.addEventListener("timeupdate",onT);v.addEventListener("progress",onT);
     v.addEventListener("durationchange",onD);v.addEventListener("play",onPl);
     v.addEventListener("pause",onPa);v.addEventListener("volumechange",onV);
+    v.addEventListener("waiting",onWait);v.addEventListener("playing",onPlayg);v.addEventListener("canplay",onCanPl);
     return()=>{
       v.removeEventListener("timeupdate",onT);v.removeEventListener("progress",onT);
       v.removeEventListener("durationchange",onD);v.removeEventListener("play",onPl);
       v.removeEventListener("pause",onPa);v.removeEventListener("volumechange",onV);
+      v.removeEventListener("waiting",onWait);v.removeEventListener("playing",onPlayg);v.removeEventListener("canplay",onCanPl);
     };
   },[]);
 
@@ -398,6 +394,27 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     hideRef.current=setTimeout(()=>{if(isPlaying)setShowCtrl(false);},3000);
   },[isPlaying]);
   useEffect(()=>{if(!isPlaying)setShowCtrl(true);},[isPlaying]);
+  // Watchdog for silent MSE stalls (fixes Piexe timestamp freezes)
+  useEffect(()=>{
+    let lastTime=-1;let stuckCount=0;
+    const intv=setInterval(()=>{
+      const v=videoRef.current;if(!v)return;
+      if(isPlaying && !v.paused && v.readyState>=2){
+        if(Math.abs(v.currentTime-lastTime)<0.05){
+          stuckCount++;
+          if(stuckCount>=3){
+            console.warn('[VidzenPlayer] Silent MSE stall detected at',v.currentTime,'nudging...');
+            v.currentTime+=0.1;stuckCount=0;
+          }
+        }else{
+          lastTime=v.currentTime;stuckCount=0;
+        }
+      }else{
+        lastTime=v?.currentTime||-1;stuckCount=0;
+      }
+    },1000);
+    return()=>clearInterval(intv);
+  },[isPlaying]);
 
   // Subtitle parsing
   useEffect(()=>{
@@ -446,9 +463,9 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
       onMouseMove={resetHide} onTouchStart={resetHide} onClick={()=>{setShowSettings(false);setShowMenu(false);}}>
       <style>{`.wv-r{-webkit-appearance:none;appearance:none;background:transparent;cursor:pointer;width:100%;height:24px;}.wv-r::-webkit-slider-thumb{-webkit-appearance:none;width:0;height:0;}.wv-r::-moz-range-thumb{border:none;width:0;height:0;}@keyframes wvspin{to{transform:rotate(360deg);}}`}</style>
 
-      {loading&&<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,background:"#000",zIndex:50}}>
+      {(loading||buffering)&&<div style={{position:"absolute",inset:0,display:"flex",flexDirection:"column",alignItems:"center",justifyContent:"center",gap:20,background:"rgba(0,0,0,0.5)",zIndex:40,pointerEvents:"none"}}>
         <RoseCurveSpinner size={72}/>
-        <p style={{color:"rgba(255,255,255,0.5)",fontSize:13,fontFamily:"system-ui,sans-serif",textAlign:"center",maxWidth:280,lineHeight:1.5,marginTop:4}}>
+        <p style={{color:"rgba(255,255,255,0.7)",fontSize:13,fontFamily:"system-ui,sans-serif",textAlign:"center",maxWidth:280,lineHeight:1.5,marginTop:4}}>
           {switchMsg||"Loading…"}
         </p>
       </div>}
@@ -461,16 +478,26 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
         </div>
       </div>}
 
-      <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"contain",display:"block",background:"#000",opacity:loading?0:1,transition:"opacity 0.2s"}}
-        playsInline preload="metadata" poster={poster||undefined} type={srcType === "mp4" ? "video/mp4" : undefined}
-        onClick={e=>{e.stopPropagation();if(needsPlay){setNeedsPlay(false);}togglePlay();}} onDoubleClick={togFs} suppressHydrationWarning/>
+      <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"contain",display:"block",background:"#000"}}
+        playsInline preload="metadata" poster={poster||undefined}
+        onClick={e=>{e.stopPropagation();togglePlay();}} onDoubleClick={togFs} suppressHydrationWarning/>
 
-      {needsPlay && !loading && !err && <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",background:"rgba(0,0,0,0.4)",zIndex:40,pointerEvents:"none"}}>
-        <div style={{width:80,height:80,borderRadius:"50%",background:"rgba(59,130,246,0.9)",display:"flex",alignItems:"center",justifyContent:"center",boxShadow:"0 10px 25px rgba(0,0,0,0.5)",pointerEvents:"auto",cursor:"pointer"}}
-             onClick={(e)=>{e.stopPropagation();setNeedsPlay(false);togglePlay();}}>
-          <svg width="36" height="36" viewBox="0 0 24 24" fill="white"><path d="M8 5v14l11-7z"/></svg>
+      {/* Center Controls (Play/Pause, Skip Back/Forward) */}
+      {!loading && !err && src && (
+        <div style={{position:"absolute",inset:0,display:"flex",alignItems:"center",justifyContent:"center",gap:80,zIndex:40,opacity:showCtrl?1:0,transition:"opacity 0.2s",pointerEvents:"none"}}>
+          <button onClick={e=>{e.stopPropagation();skipB();}} style={{background:"none",border:"none",color:"#fff",cursor:"pointer",padding:0,display:"flex",transition:"transform 0.15s, color 0.15s",pointerEvents:"auto"}} onMouseEnter={e=>{e.currentTarget.style.transform="scale(1.15)";e.currentTarget.style.color="#3b82f6";}} onMouseLeave={e=>{e.currentTarget.style.transform="scale(1)";e.currentTarget.style.color="#fff";}} aria-label="Back 10s">
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"><path strokeLinejoin="round" d="m12 5l-1.104-1.545c-.41-.576-.617-.864-.487-1.13c.13-.268.46-.283 1.12-.314Q11.763 2 12 2c5.523 0 10 4.477 10 10s-4.477 10-10 10S2 17.523 2 12a9.99 9.99 0 0 1 4-8"/><path d="M7.992 11.004C8.52 10.584 9 9.891 9.3 10.02s.204.552.204 1.212v4.776m6.498-3.408c0-1.38.066-1.752-.198-2.196s-.924-.406-1.584-.406s-1.14-.038-1.458.322c-.39.42-.222 1.2-.27 2.28c.108 1.44-.186 2.58.264 3.06c.324.396.9.336 1.584.348c.68-.008 1.092.024 1.428-.36c.372-.336.192-1.668.234-3.048Z"/></g></svg>
+          </button>
+
+          <button onClick={e=>{e.stopPropagation();togglePlay();}} style={{background:"none",border:"none",color:"#fff",cursor:"pointer",padding:0,display:"flex",transition:"transform 0.15s, color 0.15s",pointerEvents:"auto"}} onMouseEnter={e=>{e.currentTarget.style.transform="scale(1.15)";e.currentTarget.style.color="#3b82f6";}} onMouseLeave={e=>{e.currentTarget.style.transform="scale(1)";e.currentTarget.style.color="#fff";}} aria-label={isPlaying?"Pause":"Play"}>
+            {isPlaying?<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90" viewBox="0 0 24 24"><path fill="currentColor" d="M2 6c0-1.886 0-2.828.586-3.414S4.114 2 6 2s2.828 0 3.414.586S10 4.114 10 6v12c0 1.886 0 2.828-.586 3.414S7.886 22 6 22s-2.828 0-3.414-.586S2 19.886 2 18zm12 0c0-1.886 0-2.828.586-3.414S16.114 2 18 2s2.828 0 3.414.586S22 4.114 22 6v12c0 1.886 0 2.828-.586 3.414S19.886 22 18 22s-2.828 0-3.414-.586S14 19.886 14 18z"/></svg>:<svg xmlns="http://www.w3.org/2000/svg" width="90" height="90" viewBox="0 0 24 24"><path fill="currentColor" d="M21.409 9.353a2.998 2.998 0 0 1 0 5.294L8.597 21.614C6.534 22.737 4 21.277 4 18.968V5.033c0-2.31 2.534-3.769 4.597-2.648z"/></svg>}
+          </button>
+
+          <button onClick={e=>{e.stopPropagation();skipF();}} style={{background:"none",border:"none",color:"#fff",cursor:"pointer",padding:0,display:"flex",transition:"transform 0.15s, color 0.15s",pointerEvents:"auto"}} onMouseEnter={e=>{e.currentTarget.style.transform="scale(1.15)";e.currentTarget.style.color="#3b82f6";}} onMouseLeave={e=>{e.currentTarget.style.transform="scale(1)";e.currentTarget.style.color="#fff";}} aria-label="Forward 10s">
+            <svg xmlns="http://www.w3.org/2000/svg" width="60" height="60" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"><path strokeLinejoin="round" d="m12 5l1.104-1.545c.41-.576.617-.864.487-1.13c-.13-.268-.46-.283-1.12-.314Q12.237 2 12 2C6.477 2 2 6.477 2 12s4.477 10 10 10s10-4.477 10-10a9.99 9.99 0 0 0-4-8"/><path d="M7.992 11.004C8.52 10.584 9 9.891 9.3 10.02s.204.552.204 1.212v4.776m6.498-3.408c0-1.38.066-1.752-.198-2.196s-.924-.406-1.584-.406s-1.14-.038-1.458.322c-.39.42-.222 1.2-.27 2.28c.108 1.44-.186 2.58.264 3.06c.324.396.9.336 1.584.348c.68-.008 1.092.024 1.428-.36c.372-.336.192-1.668.234-3.048Z"/></g></svg>
+          </button>
         </div>
-      </div>}
+      )}
 
       {activeCue&&<div style={{position:"absolute",bottom:100,left:0,right:0,textAlign:"center",pointerEvents:"none"}}>
         <span style={{background:"rgba(0,0,0,0.78)",color:"#fff",padding:"4px 14px",borderRadius:4,fontSize:16,fontFamily:"system-ui,sans-serif"}}>{activeCue.text}</span>
@@ -536,15 +563,7 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
           <div style={{display:"flex",alignItems:"center",justifyContent:"space-between"}}>
             {/* Left */}
             <div style={{display:"flex",alignItems:"center",gap:16}}>
-              <button onClick={togglePlay} style={{background:"none",border:"none",color:"rgba(255,255,255,0.85)",cursor:"pointer",padding:0,display:"flex"}} onMouseEnter={e=>e.currentTarget.style.color="#fff"} onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.85)"} aria-label={isPlaying?"Pause":"Play"}>
-                {isPlaying?<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24"><path fill="currentColor" d="M2 6c0-1.886 0-2.828.586-3.414S4.114 2 6 2s2.828 0 3.414.586S10 4.114 10 6v12c0 1.886 0 2.828-.586 3.414S7.886 22 6 22s-2.828 0-3.414-.586S2 19.886 2 18zm12 0c0-1.886 0-2.828.586-3.414S16.114 2 18 2s2.828 0 3.414.586S22 4.114 22 6v12c0 1.886 0 2.828-.586 3.414S19.886 22 18 22s-2.828 0-3.414-.586S14 19.886 14 18z"/></svg>:<svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24"><path fill="currentColor" d="M21.409 9.353a2.998 2.998 0 0 1 0 5.294L8.597 21.614C6.534 22.737 4 21.277 4 18.968V5.033c0-2.31 2.534-3.769 4.597-2.648z"/></svg>}
-              </button>
-              <button onClick={skipB} style={{background:"none",border:"none",color:"rgba(255,255,255,0.85)",cursor:"pointer",padding:0,display:"flex"}} onMouseEnter={e=>e.currentTarget.style.color="#fff"} onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.85)"} aria-label="Back 10s">
-                <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"><path strokeLinejoin="round" d="m12 5l-1.104-1.545c-.41-.576-.617-.864-.487-1.13c.13-.268.46-.283 1.12-.314Q11.763 2 12 2c5.523 0 10 4.477 10 10s-4.477 10-10 10S2 17.523 2 12a9.99 9.99 0 0 1 4-8"/><path d="M7.992 11.004C8.52 10.584 9 9.891 9.3 10.02s.204.552.204 1.212v4.776m6.498-3.408c0-1.38.066-1.752-.198-2.196s-.924-.406-1.584-.406s-1.14-.038-1.458.322c-.39.42-.222 1.2-.27 2.28c.108 1.44-.186 2.58.264 3.06c.324.396.9.336 1.584.348c.68-.008 1.092.024 1.428-.36c.372-.336.192-1.668.234-3.048Z"/></g></svg>
-              </button>
-              <button onClick={skipF} style={{background:"none",border:"none",color:"rgba(255,255,255,0.85)",cursor:"pointer",padding:0,display:"flex"}} onMouseEnter={e=>e.currentTarget.style.color="#fff"} onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.85)"} aria-label="Forward 10s">
-                <svg xmlns="http://www.w3.org/2000/svg" width="36" height="36" viewBox="0 0 24 24"><g fill="none" stroke="currentColor" strokeLinecap="round" strokeWidth="1.5"><path strokeLinejoin="round" d="m12 5l1.104-1.545c.41-.576.617-.864.487-1.13c-.13-.268-.46-.283-1.12-.314Q12.237 2 12 2C6.477 2 2 6.477 2 12s4.477 10 10 10s10-4.477 10-10a9.99 9.99 0 0 0-4-8"/><path d="M7.992 11.004C8.52 10.584 9 9.891 9.3 10.02s.204.552.204 1.212v4.776m6.498-3.408c0-1.38.066-1.752-.198-2.196s-.924-.406-1.584-.406s-1.14-.038-1.458.322c-.39.42-.222 1.2-.27 2.28c.108 1.44-.186 2.58.264 3.06c.324.396.9.336 1.584.348c.68-.008 1.092.024 1.428-.36c.372-.336.192-1.668.234-3.048Z"/></g></svg>
-              </button>
+
               {/* Volume */}
               <div style={{display:"flex",alignItems:"center",gap:8}}>
                 <button onClick={togMute} style={{background:"none",border:"none",color:"rgba(255,255,255,0.85)",cursor:"pointer",padding:0,display:"flex"}} onMouseEnter={e=>e.currentTarget.style.color="#fff"} onMouseLeave={e=>e.currentTarget.style.color="rgba(255,255,255,0.85)"} aria-label={muted?"Unmute":"Mute"}>

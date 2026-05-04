@@ -154,13 +154,27 @@ export async function GET(request) {
   const ct = upstream.headers.get("content-type") || "";
   const isM3U8 = ct.includes("mpegurl") || ct.includes("x-mpegURL") || ext === "m3u8";
 
+  const isMp4 = ct.includes("mp4") || ext === "mp4";
+  
   const resHeaders = {
     "Access-Control-Allow-Origin": "*",
     "Access-Control-Allow-Headers": "Range",
     "Access-Control-Expose-Headers": "Content-Range, Accept-Ranges, Content-Length",
-    "Accept-Ranges": "bytes",
+    "Accept-Ranges": "bytes"
   };
-  for (const h of ["content-type","content-length","content-range","cache-control","expires","etag"]) {
+
+  if (isMp4) {
+    // MP4 native playback REQUIRES browser caching to seek the moov/mdat atoms.
+    // s-maxage=0 ensures Cloudflare edge cache ignores it, preventing 524 timeouts.
+    resHeaders["Cache-Control"] = "public, max-age=7200, s-maxage=0";
+  } else {
+    // Aggressive no-cache for M3U8 and HLS .ts segments (HLS.js handles memory buffer)
+    resHeaders["Cache-Control"] = "no-store, no-cache, must-revalidate, proxy-revalidate";
+    resHeaders["Pragma"] = "no-cache";
+    resHeaders["Expires"] = "0";
+  }
+
+  for (const h of ["content-type","content-length","content-range"]) {
     const v = upstream.headers.get(h); if (v) resHeaders[h] = v;
   }
 
