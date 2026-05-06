@@ -438,9 +438,9 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
   // Controls
   const togglePlay=useCallback(()=>{const v=videoRef.current;if(!v)return;if(isPlaying)v.pause();else v.play().catch(e=>{if(e.name!=="AbortError")console.warn('[VidzenPlayer] play():',e.message);});},[isPlaying]);
 
-  const seek=useCallback(t=>{const v=videoRef.current;if(!v)return;v.currentTime=t;setCur(t);},[]);
-  const skipB=useCallback(()=>{const v=videoRef.current;if(!v)return;const t=Math.max(0,v.currentTime-10);v.currentTime=t;setCur(t);},[]);
-  const skipF=useCallback(()=>{const v=videoRef.current;if(!v)return;const t=Math.min(v.duration||0,v.currentTime+10);v.currentTime=t;setCur(t);},[]);
+  const seek=useCallback(t=>{const v=videoRef.current;if(!v)return;lastSeekRef.current=Date.now();v.currentTime=t;setCur(t);},[]);
+  const skipB=useCallback(()=>{const v=videoRef.current;if(!v)return;lastSeekRef.current=Date.now();const t=Math.max(0,v.currentTime-10);v.currentTime=t;setCur(t);},[]);
+  const skipF=useCallback(()=>{const v=videoRef.current;if(!v)return;lastSeekRef.current=Date.now();const t=Math.min(v.duration||0,v.currentTime+10);v.currentTime=t;setCur(t);},[]);
   const chgVol=useCallback(v2=>{const v=videoRef.current;if(!v)return;v.volume=v2;if(v2>0&&v.muted)v.muted=false;},[]);
   const togMute=useCallback(()=>{const v=videoRef.current;if(!v)return;v.muted=!v.muted;},[]);
   const togFs=useCallback(()=>{
