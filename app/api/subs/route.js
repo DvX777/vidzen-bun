@@ -1,7 +1,7 @@
 // app/api/subs/route.js
 // Self-hosted subtitle system — SubDL REST API + ZIP extraction
 // All fetches have 8s abort timeout to prevent 524s
-export const runtime = "edge";
+export const runtime = "nodejs";
 
 const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
 const TIMEOUT_MS = 8000;
