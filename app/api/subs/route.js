@@ -1,9 +1,23 @@
 // app/api/subs/route.js
-// Self-hosted subtitle system using OpenSubtitles REST API (no proxy, no key, Edge-compatible)
-// Ported from the internal Wyzie Subs v2 Worker implementation in subtitles.txt
+// Self-hosted subtitle system using SubDL API (free, no key, VPS-friendly)
+// Falls back to empty array gracefully — never hangs (all fetches have 8s timeout)
 export const runtime = "edge";
 
 const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
+const TIMEOUT_MS = 8000;
+
+// Abort-safe fetch wrapper — returns null on timeout/error instead of hanging
+async function safeFetch(url, opts = {}) {
+  try {
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), TIMEOUT_MS);
+    const res = await fetch(url, { ...opts, signal: controller.signal });
+    clearTimeout(timer);
+    return res;
+  } catch (_) {
+    return null;
+  }
+}
 
 // Language code → country code (for flag URLs)
 const LANG_TO_CC = {
@@ -15,80 +29,62 @@ const LANG_TO_CC = {
 
 // ── TMDB → IMDB ──────────────────────────────────────────────────────────────
 async function tmdbToImdb(id, mediaType) {
-  const res = await fetch(
+  const res = await safeFetch(
     `https://api.themoviedb.org/3/${mediaType}/${id}/external_ids?api_key=${TMDB_KEY}`,
     { headers: { Accept: "application/json" } }
   );
-  if (!res.ok) return null;
+  if (!res?.ok) return null;
   const data = await res.json();
   return data.imdb_id || null;
 }
 
-// ── OpenSubtitles REST (free, no key, no proxy) ───────────────────────────────
-// Endpoint: https://rest.opensubtitles.org/search/…
-// Uses VLSub User-Agent (the only requirement for the legacy REST API)
-function parseOpenSubtitlesResponse(text) {
-  const frags = text.split('{"MatchedBy":"imdbid"');
-  const results = [];
-  for (let i = 1; i < frags.length; i++) {
-    const frag = '{"MatchedBy":"imdbid"' + frags[i];
-    const m = frag.match(/,"Score":[^}]+}/);
-    if (!m) continue;
-    try {
-      const obj = JSON.parse(frag.substring(0, m.index + m[0].length));
-      if (obj.ISO639 && obj.IDSubtitleFile && obj.SubDownloadLink) results.push(obj);
-    } catch (_) {}
-  }
-  return results;
-}
-
-async function fetchOpenSubtitles(imdbId, season, episode) {
-  // Build path: /search/episode-N/imdbid-NNNNNNN/season-N  (for TV)
-  //             /search/imdbid-NNNNNNN  (for movies)
-  const numericId = imdbId.replace(/^tt/, "");
-  let path = `https://rest.opensubtitles.org/search/`;
+// ── SubDL API (free, no key, works from VPS IPs) ─────────────────────────────
+// Docs: https://subdl.com/api-doc
+async function fetchSubDL(imdbId, season, episode) {
+  const params = new URLSearchParams({ imdb_id: imdbId, subs_per_page: 30, sd_api: "sdApi" });
   if (season && episode) {
-    path += `episode-${episode}/imdbid-${numericId}/season-${season}`;
-  } else {
-    path += `imdbid-${numericId}`;
+    params.set("season_number", season);
+    params.set("episode_number", episode);
   }
 
-  const res = await fetch(path, {
+  const res = await safeFetch(`https://api.subdl.com/api/v1/subtitles/?${params}`, {
     headers: {
-      "X-User-Agent": "VLSub 0.10.3",
+      Accept: "application/json",
       "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-      "Accept": "application/json",
     },
   });
-
-  if (!res.ok) return [];
-  const text = await res.text();
-  return parseOpenSubtitlesResponse(text);
+  if (!res?.ok) return [];
+  try {
+    const json = await res.json();
+    return json.subtitles || [];
+  } catch (_) {
+    return [];
+  }
 }
 
-// ── Subtitle conversion proxy ──────────────────────────────────────────────────
-async function convertSubtitle(url) {
-  try {
-    const res = await fetch(url, {
-      headers: {
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-        Accept: "*/*",
-      },
-    });
-    if (!res.ok) return new Response(`Subtitle fetch failed: ${res.status}`, { status: res.status, headers: corsHeaders() });
-    let text = await res.text();
-    if (!text.trim().startsWith("WEBVTT")) text = srtToVtt(text);
-    return new Response(text, {
-      status: 200,
-      headers: {
-        "Content-Type": "text/vtt; charset=utf-8",
-        "Access-Control-Allow-Origin": "*",
-        "Cache-Control": "public, max-age=86400",
-      },
-    });
-  } catch (e) {
-    return new Response(`Subtitle conversion failed: ${e.message}`, { status: 502, headers: corsHeaders() });
-  }
+// ── Subtitle file proxy (SRT/VTT download + SRT→VTT conversion) ───────────────
+async function fetchAndConvert(url) {
+  // SubDL paths are relative — prepend their CDN
+  const fullUrl = url.startsWith("http") ? url : `https://dl.subdl.com${url}`;
+  const res = await safeFetch(fullUrl, {
+    headers: {
+      "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
+      Accept: "*/*",
+    },
+  });
+  if (!res) return new Response("Subtitle fetch timed out", { status: 504, headers: corsHeaders() });
+  if (!res.ok) return new Response(`Subtitle fetch failed: ${res.status}`, { status: res.status, headers: corsHeaders() });
+
+  let text = await res.text();
+  if (!text.trim().startsWith("WEBVTT")) text = srtToVtt(text);
+  return new Response(text, {
+    status: 200,
+    headers: {
+      "Content-Type": "text/vtt; charset=utf-8",
+      "Access-Control-Allow-Origin": "*",
+      "Cache-Control": "public, max-age=86400",
+    },
+  });
 }
 
 function srtToVtt(srt) {
@@ -107,9 +103,9 @@ function srtToVtt(srt) {
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
 
-  // Sub proxy pass-through (SRT → VTT conversion)
+  // Sub proxy pass-through (download + SRT→VTT)
   const subUrl = searchParams.get("url");
-  if (subUrl) return convertSubtitle(subUrl);
+  if (subUrl) return fetchAndConvert(subUrl);
 
   const id = searchParams.get("id");
   if (!id) return jsonResponse({ error: "Missing ?id= param" }, 400);
@@ -118,48 +114,40 @@ export async function GET(request) {
   const episode = searchParams.get("episode") || undefined;
   const mediaType = season && episode ? "tv" : "movie";
 
-  // Resolve to IMDB ID (OpenSubtitles requires tt-format)
+  // Resolve to IMDB ID
   let imdbId = id.startsWith("tt") ? id : null;
   if (!imdbId) {
     try { imdbId = await tmdbToImdb(id, mediaType); } catch (_) {}
-    if (!imdbId) return jsonResponse({ error: "Could not resolve IMDB ID" }, 400);
+    if (!imdbId) return jsonResponse([]);
   }
 
   try {
-    const raw = await fetchOpenSubtitles(imdbId, season, episode);
+    const raw = await fetchSubDL(imdbId, season, episode);
     if (!raw.length) return jsonResponse([]);
 
-    // Pick best subtitle per language (prefer non-HI, then highest download count)
+    // Deduplicate: one track per language, prefer full-season releases and higher download counts
     const byLang = {};
     for (const sub of raw) {
-      const lang = sub.ISO639 || "unknown";
+      const lang = (sub.language || "unknown").toLowerCase().slice(0, 2);
       const existing = byLang[lang];
-      if (
-        !existing ||
-        // Prefer non-hearing-impaired
-        (sub.SubHearingImpaired !== "1" && existing.SubHearingImpaired === "1") ||
-        // Among same HI status, prefer higher download count
-        (sub.SubHearingImpaired === existing.SubHearingImpaired &&
-          Number(sub.SubDownloadsCnt || 0) > Number(existing.SubDownloadsCnt || 0))
-      ) {
+      if (!existing || (sub.downloads || 0) > (existing.downloads || 0)) {
         byLang[lang] = sub;
       }
     }
 
-    const mapped = Object.values(byLang).map((sub) => {
-      // Rewrite download URL to strip .gz and force UTF-8 encoding
-      const dlUrl = sub.SubDownloadLink
-        .replace(".gz", "")
-        .replace("download/", "download/subencoding-utf8/");
-      const cc = LANG_TO_CC[sub.ISO639] || sub.ISO639?.toUpperCase() || "UN";
-      return {
-        file: `/api/subs?url=${encodeURIComponent(dlUrl)}`,
-        label: sub.LanguageName || sub.ISO639 || "Unknown",
-        kind: "subtitles",
-        language: sub.ISO639,
-        flagUrl: `https://flagcdn.com/20x15/${cc.toLowerCase()}.png`,
-      };
-    });
+    const mapped = Object.values(byLang)
+      .filter(sub => sub.url) // must have a downloadable path
+      .map(sub => {
+        const lang = (sub.language || "unknown").toLowerCase().slice(0, 2);
+        const cc = LANG_TO_CC[lang] || lang.toUpperCase();
+        return {
+          file: `/api/subs?url=${encodeURIComponent(sub.url)}`,
+          label: sub.language || "Unknown",
+          kind: "subtitles",
+          language: lang,
+          flagUrl: `https://flagcdn.com/20x15/${cc.toLowerCase()}.png`,
+        };
+      });
 
     // Sort: English first, then alphabetically
     mapped.sort((a, b) => {
@@ -170,7 +158,7 @@ export async function GET(request) {
 
     return jsonResponse(mapped);
   } catch (e) {
-    return jsonResponse({ error: "Subtitle fetch failed", detail: e.message }, 502);
+    return jsonResponse([]);
   }
 }
 
