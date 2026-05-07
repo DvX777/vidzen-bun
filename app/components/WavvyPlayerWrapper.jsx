@@ -21,10 +21,25 @@ function useIsMobile() {
   return mob;
 }
 
+// Helper for fetch with timeout to prevent infinite loops
+async function fetchWithTimeout(url, options = {}) {
+  const { timeout = 15000, ...fetchOptions } = options;
+  const controller = new AbortController();
+  const id = setTimeout(() => controller.abort(), timeout);
+  try {
+    const response = await fetch(url, { ...fetchOptions, signal: controller.signal });
+    clearTimeout(id);
+    return response;
+  } catch (error) {
+    clearTimeout(id);
+    throw error;
+  }
+}
+
 // Each fetcher returns { provider, sources:[{url,type,label,dub?,quality?}] }
 async function fetchMoviebox(type,id,season,episode){
   const path=type==="movie"?`${PEACH_API}/moviebox/movie/${id}`:`${PEACH_API}/moviebox/tv/${id}/season/${season}/episode/${episode}`;
-  const d=await fetch(path).then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();});
+  const d=await fetchWithTimeout(path).then(r=>{if(!r.ok)throw new Error("HTTP "+r.status);return r.json();});
   if(!d.sources?.length)throw new Error("MB_NO_SOURCES");
   const sorted=[...d.sources].sort((a,b)=>{
     if(a.dub==="English"&&b.dub!=="English")return -1;
@@ -42,7 +57,7 @@ async function fetchVideasy(){
 async function fetchPiexe(type,id,season,episode){
   const p=new URLSearchParams({id,type});
   if(season){p.set("season",season);p.set("ep",episode);}
-  const d=await fetch(`/api/piexe?${p}`).then(r=>{if(!r.ok)throw new Error("PX_"+r.status);return r.json();});
+  const d=await fetchWithTimeout(`/api/piexe?${p}`).then(r=>{if(!r.ok)throw new Error("PX_"+r.status);return r.json();});
   if(!d.sources?.length)throw new Error(d.error||"PX_NO_SOURCES");
   return{provider:"piexe",sources:d.sources.map(s=>({url:s.url,type:"hls",label:s.label||"Default"}))};
 }
@@ -253,7 +268,9 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     }else{
       setTimeout(()=>{
         if(job.cancelled)return;
+        let initTimeout;
         const onErr=()=>{
+          clearTimeout(initTimeout);
           if(job.cancelled)return;
           const cache=provCacheRef.current[prov]||[];
           const idx=cache.findIndex(s=>s.url===url);
@@ -261,8 +278,14 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
           if(next&&next.type==='mp4'){playSource(next.url,'mp4',prov,next);return;}
           autoFallback();
         };
+        initTimeout = setTimeout(()=>{
+          if(!job.cancelled){
+            console.warn('[VidzenPlayer] MP4 load timeout:',url);
+            onErr();
+          }
+        }, 15000);
         v.addEventListener('error',onErr,{once:true});
-        v.addEventListener('loadedmetadata',()=>{restorePosition();onReady();},{once:true});
+        v.addEventListener('loadedmetadata',()=>{clearTimeout(initTimeout);restorePosition();onReady();},{once:true});
         v.src=url;v.load();v.play().catch(()=>{});
       },150);
     }
