@@ -1,19 +1,19 @@
 // app/api/videasy/route.js
-// Videasy provider — Yoru server only (CDN id: "cdn")
-// Only Yoru (bold-cdn Cloudflare Worker) is reliably working.
+// Videasy provider — Yoru CDN (bold-cdn Cloudflare Worker)
+// NOTE: Yoru's CF Worker blocks VPS datacenter IPs.
+// URLs are returned RAW (no proxy token) so the browser's HLS.js fetches them directly.
+// Browser residential/CF IPs are not blocked by Yoru.
 
 export const runtime = "nodejs";
-import { proxyToken } from "@/lib/serverCrypto";
 
-const TMDB_KEY  = process.env.TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
-const YORU_ID   = "cdn"; // Yoru server id in videasy
+const TMDB_KEY    = process.env.TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
+const YORU_ID     = "cdn";
+const FETCH_UA    = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
 
-const FETCH_UA  = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/137.0.0.0 Safari/537.36";
-
-const META_CACHE   = new Map(); // `${type}-${id}` → {title, year}
-const STREAM_CACHE = new Map(); // `${type}-${id}[-s-e]` → {url, ts}
-const META_TTL   = 24 * 60 * 60 * 1000; // 24h (TMDB metadata is stable)
-const STREAM_TTL =  5 * 60 * 1000;       // 5 min (signed CDN URLs)
+const META_CACHE   = new Map();
+const STREAM_CACHE = new Map();
+const META_TTL     = 24 * 60 * 60 * 1000; // 24h
+const STREAM_TTL   =  4 * 60 * 1000;       // 4 min (Yoru tokens are short-lived)
 
 // ── TMDB meta ────────────────────────────────────────────────────────────────
 
@@ -43,19 +43,19 @@ async function getTmdbMeta(tmdbId, type) {
   return meta;
 }
 
-// ── Videasy Yoru fetch + decrypt ─────────────────────────────────────────────
+// ── Videasy fetch + decrypt → all quality sources ─────────────────────────────
 
-async function fetchYoruStream(tmdbId, type, meta, season, episode) {
-  const cacheKey = type === "tv" ? `tv-${tmdbId}-${season}-${episode}` : `movie-${tmdbId}`;
+async function fetchYoruStreams(tmdbId, type, meta, season, episode) {
+  const cacheKey = type === "tv"
+    ? `tv-${tmdbId}-${season}-${episode}`
+    : `movie-${tmdbId}`;
   const cached = STREAM_CACHE.get(cacheKey);
-  if (cached && Date.now() - cached.ts < STREAM_TTL) return cached.url;
+  if (cached && Date.now() - cached.ts < STREAM_TTL) return cached.streams;
 
-  // Build the Videasy API URL for Yoru (server id = "cdn")
-  const encodedTitle = encodeURIComponent(meta.title);
-  let videasyUrl = `https://api.videasy.net/${YORU_ID}/sources-with-title?title=${encodedTitle}&mediaType=${type}&year=${meta.year}&tmdbId=${tmdbId}`;
+  // Step 1: Fetch encrypted data from Videasy
+  let videasyUrl = `https://api.videasy.net/${YORU_ID}/sources-with-title?title=${encodeURIComponent(meta.title)}&mediaType=${type}&year=${meta.year}&tmdbId=${tmdbId}`;
   if (type === "tv") videasyUrl += `&seasonId=${season}&episodeId=${episode}`;
 
-  // Step 1: Fetch encrypted stream data from Videasy
   const encRes = await fetch(videasyUrl, {
     headers: { "User-Agent": FETCH_UA, Connection: "keep-alive" },
     signal: AbortSignal.timeout(20000),
@@ -77,23 +77,36 @@ async function fetchYoruStream(tmdbId, type, meta, season, episode) {
   const result = decrypted?.result;
   if (!result) throw new Error("DECRYPT_NO_RESULT");
 
-  // Extract stream URL from result (can be string or object)
-  let streamUrl = null;
-  if (typeof result === "string") {
-    streamUrl = result;
-  } else {
-    streamUrl = result.stream || result.file || result.url
-      || result.sources?.[0]?.url || result.sources?.[0]?.file
-      || null;
+  // Step 3: Extract all quality sources
+  let streams = [];
+
+  if (Array.isArray(result?.sources) && result.sources.length > 0) {
+    // New format: { sources: [{ quality, url }] }
+    streams = result.sources
+      .filter(s => s?.url?.includes("m3u8"))
+      .map(s => ({ url: s.url, quality: s.quality || "HD" }));
+  } else if (typeof result === "string" && result.includes("m3u8")) {
+    streams = [{ url: result, quality: "HD" }];
+  } else if (result?.url?.includes("m3u8")) {
+    streams = [{ url: result.url, quality: "HD" }];
+  } else if (result?.stream?.includes("m3u8")) {
+    streams = [{ url: result.stream, quality: "HD" }];
   }
 
-  if (!streamUrl || !streamUrl.includes("m3u8")) throw new Error("NO_STREAM_URL");
+  // Sort: 1080P first
+  streams.sort((a, b) => {
+    const qa = parseInt(a.quality) || 0;
+    const qb = parseInt(b.quality) || 0;
+    return qb - qa;
+  });
 
-  STREAM_CACHE.set(cacheKey, { url: streamUrl, ts: Date.now() });
-  return streamUrl;
+  if (!streams.length) throw new Error("NO_STREAM_URL");
+
+  STREAM_CACHE.set(cacheKey, { streams, ts: Date.now() });
+  return streams;
 }
 
-// ── Route Handler ────────────────────────────────────────────────────────────
+// ── Route Handler ─────────────────────────────────────────────────────────────
 
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
@@ -108,23 +121,21 @@ export async function GET(request) {
   }
 
   try {
-    const meta = await getTmdbMeta(tmdbId, type);
-    const streamUrl = await fetchYoruStream(tmdbId, type, meta, season, ep);
+    const meta    = await getTmdbMeta(tmdbId, type);
+    const streams = await fetchYoruStreams(tmdbId, type, meta, season, ep);
 
-    // Encrypt the Yoru CF worker URL into a server token with spoofed headers.
-    // The Videasy CDN requires these headers to bypass hotlink protection.
-    const proxied = await proxyToken(streamUrl, { 
-      origin: "https://videasy.net", 
-      referer: "https://videasy.net/" 
+    // Return raw Yoru URLs — browser HLS.js fetches them directly (VPS IP is blocked by Yoru).
+    // Yoru is a CF Worker that works fine from residential/browser IPs.
+    const sources = streams.map(s => ({
+      url:      s.url,
+      type:     "hls",
+      label:    `Hexa · ${s.quality}`,
+      provider: "videasy",
+    }));
+
+    return Response.json({ sources }, {
+      headers: { "Cache-Control": "no-store" },
     });
-    return Response.json({
-      sources: [{
-        url: proxied,
-        type: "hls",
-        label: "Videasy · Yoru",
-        provider: "videasy",
-      }],
-    }, { headers: { "Cache-Control": "no-store" } });
 
   } catch (err) {
     console.warn("[videasy]", err.message);
