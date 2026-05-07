@@ -34,12 +34,45 @@ async function fetchMoviebox(type,id,season,episode){
   return{provider:"moviebox",sources:sorted.map(s=>({url:s.url,type:(s.url.includes('.m3u8')?"hls":(s.type||"mp4")),dub:s.dub||"Original",quality:s.quality||0,label:[s.quality&&`${s.quality}p`,s.dub&&s.dub!=="Original"?s.dub:null].filter(Boolean).join(" ")||"Default"}))};
 }
 async function fetchVideasy(type,id,season,episode){
-  const p=new URLSearchParams({id,type});
-  if(season){p.set("season",season);p.set("ep",episode);}
-  const d=await fetch(`/api/videasy?${p}`).then(r=>{if(!r.ok)throw new Error("VD_"+r.status);return r.json();});
-  if(!d.sources?.length)throw new Error(d.error||"VD_NO_SOURCES");
-  return{provider:"videasy",sources:d.sources.map(s=>({url:s.url,type:"hls",label:s.label||"Default"}))};
+  // Both api.videasy.net and enc-dec.app return CORS: *
+  // We call them client-side so the browser's IP gets the Yoru token (VPS IP was blocked by Yoru)
+
+  // Step 1: get title+year from TMDB (TMDB_KEY is public)
+  const tmdbUrl=type==="movie"
+    ?`https://api.themoviedb.org/3/movie/${id}?api_key=${TMDB_KEY}&language=en-US`
+    :`https://api.themoviedb.org/3/tv/${id}?api_key=${TMDB_KEY}&language=en-US`;
+  const tmdbData=await fetch(tmdbUrl).then(r=>{if(!r.ok)throw new Error("VD_TMDB");return r.json();});
+  const title=tmdbData.title||tmdbData.name;
+  const year=(tmdbData.release_date||tmdbData.first_air_date||"").slice(0,4);
+  if(!title)throw new Error("VD_NO_TITLE");
+
+  // Step 2: fetch encrypted stream from Videasy
+  let vUrl=`https://api.videasy.net/cdn/sources-with-title?title=${encodeURIComponent(title)}&mediaType=${type}&year=${year}&tmdbId=${id}`;
+  if(type==="tv")vUrl+=`&seasonId=${season}&episodeId=${episode}`;
+  const enc=await fetch(vUrl).then(r=>{if(!r.ok)throw new Error("VD_ENC_"+r.status);return r.text();});
+  if(!enc.trim())throw new Error("VD_EMPTY");
+
+  // Step 3: decrypt via enc-dec.app
+  const dec=await fetch("https://enc-dec.app/api/dec-videasy",{
+    method:"POST",
+    headers:{"Content-Type":"application/json"},
+    body:JSON.stringify({text:enc.trim(),id:String(id)}),
+  }).then(r=>{if(!r.ok)throw new Error("VD_DEC_"+r.status);return r.json();});
+
+  const result=dec?.result;
+  let sources=[];
+  if(Array.isArray(result?.sources)){
+    sources=result.sources
+      .filter(s=>s?.url?.includes("m3u8"))
+      .sort((a,b)=>(parseInt(b.quality)||0)-(parseInt(a.quality)||0))
+      .map(s=>({url:s.url,type:"hls",label:`Hexa · ${s.quality||"HD"}`}));
+  }else if(typeof result==="string"&&result.includes("m3u8")){
+    sources=[{url:result,type:"hls",label:"Hexa · HD"}];
+  }
+  if(!sources.length)throw new Error("VD_NO_SOURCES");
+  return{provider:"videasy",sources};
 }
+
 async function fetchPiexe(type,id,season,episode){
   const p=new URLSearchParams({id,type});
   if(season){p.set("season",season);p.set("ep",episode);}
