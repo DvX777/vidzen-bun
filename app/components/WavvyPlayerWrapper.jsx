@@ -33,13 +33,10 @@ async function fetchMoviebox(type,id,season,episode){
   });
   return{provider:"moviebox",sources:sorted.map(s=>({url:s.url,type:(s.url.includes('.m3u8')?"hls":(s.type||"mp4")),dub:s.dub||"Original",quality:s.quality||0,label:[s.quality&&`${s.quality}p`,s.dub&&s.dub!=="Original"?s.dub:null].filter(Boolean).join(" ")||"Default"}))};
 }
-async function fetchVideasy(type,id,season,episode){
-  // Yoru CDN rejects all external q-tokens regardless of IP/Referer.
-  // Use the official player.videasy.net embed instead — it handles auth internally.
-  const embedUrl=(type==="tv"&&season&&episode)
-    ?`https://player.videasy.net/tv/${id}/${season}/${episode}`
-    :`https://player.videasy.net/movie/${id}`;
-  return{provider:"videasy",sources:[{url:embedUrl,type:"embed",label:"Hexa"}]};
+async function fetchVideasy(){
+  // Yoru CDN token validation is broken for all external consumers.
+  // Throw immediately so the auto-fallback chain tries the next provider.
+  throw new Error("VD_YORU_DOWN");
 }
 
 async function fetchPiexe(type,id,season,episode){
@@ -207,8 +204,6 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
     activeProvRef.current=prov;
     setActiveProv(prov);setSrcType(type_);
     if(srcObj)setActiveSource(srcObj);
-    // Embed type (e.g. videasy iframe) — no HLS needed, just clear loading
-    if(type_==="embed"){setLoading(false);setSwitchMsg(null);return;}
     const onReady=()=>{if(!job.cancelled){setLoading(false);setSwitchMsg(null);}};
     // Shared progress restore (works for both HLS and MP4)
     const restorePosition=()=>{
@@ -502,14 +497,6 @@ export default function WavvyPlayerWrapper({type,id,season,episode}){
       <video ref={videoRef} style={{width:"100%",height:"100%",objectFit:"contain",display:"block",background:"#000"}}
         playsInline preload="auto" poster={poster||undefined}
         onClick={e=>{e.stopPropagation();togglePlay();}} onDoubleClick={togFs} suppressHydrationWarning/>
-
-      {/* Videasy / Hexa embed iframe — covers all controls at z-index 100 */}
-      {activeSource?.type==="embed"&&(
-        <iframe src={activeSource.url}
-          style={{position:"absolute",inset:0,width:"100%",height:"100%",border:"none",zIndex:100,background:"#000"}}
-          allow="autoplay; fullscreen; encrypted-media; picture-in-picture"
-          allowFullScreen referrerPolicy="origin" title="Hexa Player"/>
-      )}
 
       {/* Double-tap seek zones (mobile) */}
       {isMobile&&!loading&&!err&&activeSource?.url&&(
