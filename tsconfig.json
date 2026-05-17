@@ -39,6 +39,8 @@
     "node_modules",
     "wavvy-src",
     "vidmax-ref",
-    "reference"
+    "reference",
+    "nb-system",
+    "np-module"
   ]
 }

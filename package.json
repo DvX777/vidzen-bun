@@ -7,19 +7,22 @@
     "start": "next start"
   },
   "dependencies": {
+    "@upstash/redis": "^1.38.0",
+    "@vidstack/react": "^1.12.0",
     "framer-motion": "^12.34.1",
     "hls.js": "^1.6.16",
+    "ioredis": "^5.10.1",
     "lucide-react": "^0.574.0",
     "next": "^16.1.6",
     "react": "^18.2.0",
     "react-dom": "^18.2.0"
   },
   "devDependencies": {
-    "typescript": "^5.4.5",
+    "@tailwindcss/postcss": "^4.0.0",
     "@types/node": "^20.12.7",
     "@types/react": "^18.2.79",
     "@types/react-dom": "^18.2.25",
     "tailwindcss": "^4.0.0",
-    "@tailwindcss/postcss": "^4.0.0"
+    "typescript": "^5.4.5"
   }
 }

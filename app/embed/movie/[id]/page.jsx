@@ -1,5 +1,5 @@
 // app/embed/movie/[id]/page.jsx
-import WavvyPlayerWrapper from '../../../components/WavvyPlayerWrapper';
+import VidzenPlayer from '../../../components/VidzenPlayer';
 
 export const dynamic = 'force-dynamic';
 
@@ -17,7 +17,7 @@ export default async function MovieEmbedPage({ params }) {
   return (
     <main style={{ background: '#000', minHeight: '100vh', display: 'flex', alignItems: 'center', justifyContent: 'center', padding: 0 }}>
       <div style={{ width: '100%', maxWidth: '100vw' }}>
-        <WavvyPlayerWrapper type="movie" id={id} />
+        <VidzenPlayer type="movie" id={id} />
       </div>
     </main>
   );

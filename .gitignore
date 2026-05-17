@@ -53,3 +53,9 @@ bun.lockb
 /scratch
 .tempmediaStorage
 docs/*
+np-module/*
+public/*
+workers/*
+*md
+nb-system/*
+*html
