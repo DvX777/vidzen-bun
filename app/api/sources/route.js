@@ -13,10 +13,10 @@ const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
 // Internal names → hex IDs (network tab won't reveal provider names)
 const PROVIDER_ALIAS = {
   primesrc: "sv-c3d5",
-  vidcore:  "sv-a1f3",
-  vidfast:  "sv-b2e4",
+  vidcore: "sv-a1f3",
+  vidfast: "sv-b2e4",
   moviebox: "sv-d4c6",
-  piexe:    "sv-e5b7",
+  piexe: "sv-e5b7",
 };
 const ALIAS_REVERSE = Object.fromEntries(Object.entries(PROVIDER_ALIAS).map(([k, v]) => [v, k]));
 function maskName(name) { return PROVIDER_ALIAS[name] || name; }
@@ -27,8 +27,9 @@ const SERVERS = Object.values(PROVIDER_ALIAS);
 // The default demo movie ID shown on the landing page
 const DEMO_MOVIE_ID = "786892";
 
-// Suppress repetitive primesrc JSON parse errors
-let primesrcErrorLogged = false;
+// Rate-limit primesrc error logging (max once per 60s)
+let lastPrimesrcErrorTime = 0;
+const PRIMESRC_ERROR_INTERVAL_MS = 60_000;
 
 // ── Fetch with AbortController timeout ─────────────────────────────────────
 async function fetchJSON(url, timeoutMs = 15000) {
@@ -46,14 +47,17 @@ async function fetchJSON(url, timeoutMs = 15000) {
     try {
       return JSON.parse(text);
     } catch {
-      // Only log primesrc parse failures once (it fails often due to CF bypass)
+      // Rate-limit primesrc error logging (once per 60s instead of full suppression)
       if (url.includes("primesrc")) {
-        if (!primesrcErrorLogged) {
-          console.warn(`[fetchJSON] primesrc returned non-JSON (CF bypass likely failed)`);
-          primesrcErrorLogged = true;
+        const now = Date.now();
+        if (now - lastPrimesrcErrorTime > PRIMESRC_ERROR_INTERVAL_MS) {
+          lastPrimesrcErrorTime = now;
+          console.warn(`[fetchJSON] primesrc returned non-JSON (CF bypass likely failed). Status: ${res.status}`);
         }
       } else {
-        console.error(`[fetchJSON] Non-JSON response from ${url.substring(0, 80)}: ${text.substring(0, 100)}`);
+        // For vidcore/vidfast 502s, include status code for debugging
+        const statusHint = res.status >= 500 ? ` [HTTP ${res.status}]` : '';
+        console.error(`[fetchJSON]${statusHint} Non-JSON response from ${url.substring(0, 80)}: ${text.substring(0, 100)}`);
       }
       return null;
     }
@@ -81,7 +85,7 @@ function unwrapProxyUrl(proxyPath) {
         const h = JSON.parse(decodeURIComponent(headersStr));
         referer = h.referer || h.Referer || null;
         origin = h.origin || h.Origin || null;
-      } catch {}
+      } catch { }
     }
     return { url: cdnUrl, referer, origin };
   } catch {
@@ -306,27 +310,64 @@ export async function GET(request) {
     }, { headers: { "Cache-Control": "no-store" } });
   }
 
-  // ── Forced server ───────────────────────────────────────────────────────
+  // ── Forced server (with retry + stale cache fallback) ─────────────────
   if (forcedServer && PROVIDER_MAP[forcedServer]) {
+    // Attempt 1
+    let result = null;
+    let lastError = null;
     try {
       console.log(`[sources] Forced server: ${forcedServer} for ${type}/${id}`);
-      const result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
-      if (result) {
-        // Cache the successful result
-        await cacheSet(cacheKey, stripVaultForCache(result), DEFAULT_TTL);
-        return Response.json({
-          ...result,
-          provider: maskName(forcedServer),
-          servers: SERVERS,
-        }, { headers: { "Cache-Control": "no-store" } });
-      }
+      result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
     } catch (err) {
-      console.warn(`[sources] ${forcedServer} failed:`, err.message);
+      lastError = err.message;
+      console.warn(`[sources] ${forcedServer} attempt 1 failed:`, err.message);
     }
-    await cacheSet(cacheKey, { sources: [], subtitles: [], provider: null, error: `${forcedServer} returned no sources` }, NOT_FOUND_TTL);
+
+    // Retry once after 2s if first attempt returned nothing
+    if (!result?.sources?.length && !lastError?.includes("aborted")) {
+      try {
+        console.log(`[sources] Retrying ${forcedServer} after 2s...`);
+        await new Promise(r => setTimeout(r, 2000));
+        result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
+      } catch (err) {
+        lastError = err.message;
+        console.warn(`[sources] ${forcedServer} attempt 2 failed:`, err.message);
+      }
+    }
+
+    if (result?.sources?.length) {
+      await cacheSet(cacheKey, stripVaultForCache(result), DEFAULT_TTL);
+      return Response.json({
+        ...result,
+        provider: maskName(forcedServer),
+        servers: SERVERS,
+      }, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    // Stale cache fallback: check if we have cached race results (without server suffix)
+    const raceCacheKey = sourceKey(type, id, null, season, episode);
+    const staleFallback = await cacheGet(raceCacheKey);
+    if (staleFallback?.sources?.length) {
+      console.log(`[sources] ${forcedServer} failed but found stale race cache — using fallback`);
+      const refreshed = refreshVaultUrls(staleFallback);
+      return Response.json({
+        ...refreshed,
+        servers: SERVERS,
+        cached: true,
+        fallback: true,
+        error: `${forcedServer} is temporarily unavailable — showing cached results`,
+      }, { headers: { "Cache-Control": "no-store" } });
+    }
+
+    // Distinguish error type for the client
+    const errorMsg = lastError?.includes("502") || lastError?.includes("timed out")
+      ? `${forcedServer} is temporarily unreachable (server issue)`
+      : `${forcedServer} returned no sources`;
+
+    await cacheSet(cacheKey, { sources: [], subtitles: [], provider: null, error: errorMsg }, NOT_FOUND_TTL);
     return Response.json({
       sources: [], subtitles: [], provider: null, servers: SERVERS,
-      error: `${forcedServer} returned no sources`,
+      error: errorMsg,
     }, { status: 200, headers: { "Cache-Control": "no-store" } });
   }
 

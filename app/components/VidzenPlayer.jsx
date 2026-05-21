@@ -23,6 +23,7 @@ const SERVER_LABELS = {
 export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const playerRef = useRef(null);
   const [sources, setSources] = useState([]);
+  const sourcesRef = useRef(sources);
   const [subtitles, setSubtitles] = useState([]);
   const [currentServer, setCurrentServer] = useState(null);
   const [availableServers, setAvailableServers] = useState([]);
@@ -32,6 +33,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const [failedServers, setFailedServers] = useState(new Set());
   const [meta, setMeta] = useState({ title: "", poster: "", backdrop: "" });
   const [devToolsBlocked, setDevToolsBlocked] = useState(false);
+  const [toast, setToast] = useState(null); // { message, type: 'error' | 'warn' }
 
   const progressRef = useRef({ time: 0, duration: 0 });
   const saveTimerRef = useRef(null);
@@ -70,6 +72,12 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     fetchMeta();
   }, [id, type]);
 
+  // ── Toast notification helper ────────────────────────────────────────
+  const showToast = useCallback((message, type = 'error') => {
+    setToast({ message, type });
+    setTimeout(() => setToast(null), 4000);
+  }, []);
+
   // ── Fetch sources from bridge API ───────────────────────────────────────
   const fetchSources = useCallback(async (server = null) => {
     setError(null);
@@ -86,11 +94,25 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       if (data.servers) setAvailableServers(data.servers);
 
       if (!data.sources?.length) {
-        if (server) setFailedServers(prev => new Set([...prev, server]));
+        // Server switch failed — DON'T clear current stream
+        if (server && sourcesRef.current.length > 0) {
+          setFailedServers(prev => new Set([...prev, server]));
+          // Show a toast instead of replacing the player
+          const msg = data.error || `${SERVER_LABELS[server]?.name || server} is unavailable`;
+          showToast(msg, 'error');
+          setSwitching(null);
+          return; // Keep current stream playing
+        }
         throw new Error(data.error || "No sources found");
       }
 
+      // Handle fallback responses (stale cache used when forced server failed)
+      if (data.fallback && data.error) {
+        showToast(data.error, 'warn');
+      }
+
       setSources(data.sources);
+      sourcesRef.current = data.sources;
       setCurrentServer(data.provider);
 
       // Fetch subtitles from our subs API if provider didn't return any
@@ -102,10 +124,15 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       setSwitching(null);
     } catch (err) {
       console.error("[VidzenPlayer] Source fetch failed:", err.message);
-      setError(err.message);
+      // Only show error overlay if we have NO current sources at all
+      if (!sourcesRef.current.length) {
+        setError(err.message);
+      } else {
+        showToast(err.message, 'error');
+      }
       setSwitching(null);
     }
-  }, [type, id, season, episode]);
+  }, [type, id, season, episode, showToast]);
 
   // ── Fetch subtitles from our /api/subs endpoint ─────────────────────────
   const fetchSubtitles = useCallback(async () => {
@@ -122,6 +149,17 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   }, [id, type, season, episode]);
 
   useEffect(() => { fetchSources(); }, [fetchSources]);
+
+  // ── Auto-clear failed servers after 2 minutes (transient 502s recover) ───
+  useEffect(() => {
+    if (failedServers.size === 0) return;
+    const timer = setTimeout(() => {
+      console.log("[VidzenPlayer] Auto-clearing failed servers (2m cooldown)");
+      setFailedServers(new Set());
+    }, 2 * 60 * 1000);
+    return () => clearTimeout(timer);
+  }, [failedServers]);
+
 
   // ── Watch progress: save periodically ───────────────────────────────────
   useEffect(() => {
@@ -281,6 +319,18 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
             setError(null);
             fetchSources();
           }}>Retry</button>
+        </div>
+      )}
+
+      {/* Toast notification (server switch failures, fallback warnings) */}
+      {toast && (
+        <div style={{
+          ...styles.toast,
+          borderColor: toast.type === 'warn' ? 'rgba(245,158,11,0.4)' : 'rgba(239,68,68,0.4)',
+          color: toast.type === 'warn' ? '#fbbf24' : '#fca5a5',
+        }}>
+          <span style={styles.toastIcon}>{toast.type === 'warn' ? '⚠️' : '❌'}</span>
+          <span style={styles.toastText}>{toast.message}</span>
         </div>
       )}
 
@@ -472,12 +522,46 @@ const styles = {
     fontSize: "12px",
     fontWeight: "bold",
   },
+  toast: {
+    position: "absolute",
+    bottom: "60px",
+    left: "50%",
+    transform: "translateX(-50%)",
+    display: "flex",
+    alignItems: "center",
+    gap: "8px",
+    padding: "10px 18px",
+    background: "rgba(10,10,10,0.9)",
+    backdropFilter: "blur(12px)",
+    border: "1px solid rgba(239,68,68,0.4)",
+    borderRadius: "8px",
+    zIndex: 45,
+    maxWidth: "90%",
+    animation: "vidzen-toast-in 0.3s ease-out",
+    boxShadow: "0 4px 20px rgba(0,0,0,0.4)",
+  },
+  toastIcon: {
+    fontSize: "14px",
+    flexShrink: 0,
+  },
+  toastText: {
+    fontSize: "12px",
+    fontFamily: "'Inter', -apple-system, sans-serif",
+    fontWeight: 500,
+    lineHeight: 1.4,
+  },
 };
 
 // Inject keyframe animation for spinner
 if (typeof document !== "undefined" && !document.getElementById("vidzen-keyframes")) {
   const style = document.createElement("style");
   style.id = "vidzen-keyframes";
-  style.textContent = `@keyframes vidzen-spin { to { transform: rotate(360deg); } }`;
+  style.textContent = `
+    @keyframes vidzen-spin { to { transform: rotate(360deg); } }
+    @keyframes vidzen-toast-in {
+      from { opacity: 0; transform: translateX(-50%) translateY(10px); }
+      to { opacity: 1; transform: translateX(-50%) translateY(0); }
+    }
+  `;
   document.head.appendChild(style);
 }
