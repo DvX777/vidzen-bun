@@ -21,6 +21,8 @@ const SERVER_LABELS = {
   "sv-b2e4": { name: "Fast",  color: "#8b5cf6" },
   "sv-d4c6": { name: "Orbit", color: "#10b981" },
   "sv-e5b7": { name: "Delta", color: "#f59e0b" },
+  "sv-f6a8": { name: "Turbo", color: "#06b6d4" },
+  "sv-g7b9": { name: "Flux",  color: "#ec4899" },
 };
 
 // ── Vidstack-native icons ─────────────────────────────────────────────────

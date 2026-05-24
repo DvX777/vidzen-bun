@@ -59,3 +59,7 @@ workers/*
 *md
 nb-system/*
 *html
+*txt
+*har
+/new_approch/*
+*.ps1

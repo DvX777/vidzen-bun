@@ -17,6 +17,8 @@ const PROVIDER_ALIAS = {
   vidfast: "sv-b2e4",
   moviebox: "sv-d4c6",
   piexe: "sv-e5b7",
+  vidlink: "sv-f6a8",
+  yflix: "sv-g7b9",
 };
 const ALIAS_REVERSE = Object.fromEntries(Object.entries(PROVIDER_ALIAS).map(([k, v]) => [v, k]));
 function maskName(name) { return PROVIDER_ALIAS[name] || name; }
@@ -193,6 +195,68 @@ function normalizePiexe(data) {
   return { sources, subtitles: [] };
 }
 
+function normalizeVidlink(data) {
+  // Unwrap backend envelope: { status, success, data: { sources, subtitles } }
+  const payload = data?.data || data;
+  if (data?.success === false || payload?.error) return null;
+  if (!payload?.sources?.length) return null;
+  const sources = payload.sources.map(s => {
+    // storm.vodvidl.site is a CORS proxy behind Cloudflare (blocks all server IPs).
+    // URL format: https://storm.vodvidl.site/proxy/PATH.m3u8?headers=...&host=REAL_HOST
+    // Fix: bypass storm → construct direct URL to the real host (e.g. aurorabird6.live)
+    // Then vault with videostr.net headers (required by the real host, verified 200 OK).
+    const decodedUrl = decodeURIComponent(s.url);
+    let finalUrl = decodedUrl;
+    let vaultOrigin = "https://videostr.net";
+    let vaultReferer = "https://videostr.net/";
+
+    try {
+      const parsed = new URL(decodedUrl);
+      if (parsed.hostname.includes("vodvidl.site") && parsed.pathname.startsWith("/proxy/")) {
+        const path = parsed.pathname.replace(/^\/proxy\//, "");
+        const realHost = parsed.searchParams.get("host");
+        if (realHost && path) {
+          finalUrl = `${realHost.replace(/\/$/, "")}/${path}`;
+        }
+        // Extract headers from query if available
+        try {
+          const hdrs = JSON.parse(parsed.searchParams.get("headers") || "{}");
+          if (hdrs.origin) vaultOrigin = hdrs.origin;
+          if (hdrs.referer) vaultReferer = hdrs.referer;
+        } catch {}
+      }
+    } catch {}
+
+    return {
+      url: vaultUrl(finalUrl, { origin: vaultOrigin, referer: vaultReferer }),
+      type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
+      label: s.quality || s.server || "Auto",
+      server: maskName("vidlink"),
+    };
+  });
+  // Drop VidLink's own subtitles (megafiles.store — dead/timeout)
+  // Vidzen's /api/subs system handles subtitles independently
+  return { sources, subtitles: [] };
+}
+
+function normalizeYflix(data) {
+  // Unwrap backend envelope: { status, success, data: { sources, subtitles } }
+  const payload = data?.data || data;
+  if (data?.success === false || payload?.error) return null;
+  if (!payload?.sources?.length) return null;
+  const sources = payload.sources.map(s => ({
+    url: obfuscateUrl(s.url, "yflix"),
+    type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
+    label: s.quality || s.server || "Auto",
+    server: maskName("yflix"),
+  }));
+  const subtitles = (payload.subtitles || []).map(s => ({
+    url: s.url,
+    lang: s.label || s.lang || "Unknown",
+  }));
+  return { sources, subtitles };
+}
+
 // ── Provider fetch functions ───────────────────────────────────────────────
 function tryPrimeSrc(type, id, season, episode) {
   const path = type === "movie"
@@ -230,12 +294,28 @@ function tryPiexe(type, id, season, episode) {
   return fetchJSON(`${origin}/api/piexe?${params}`, 15000).then(normalizePiexe);
 }
 
+function tryVidlink(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/vidlink/movie/${id}`
+    : `${NB_URL}/stream/vidlink/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 15000).then(normalizeVidlink);
+}
+
+function tryYflix(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/yflix/movie/${id}`
+    : `${NB_URL}/stream/yflix/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 25000).then(normalizeYflix);
+}
+
 const PROVIDER_MAP = {
   primesrc: tryPrimeSrc,
   vidcore: tryVidcore,
   vidfast: tryVidfast,
   moviebox: tryMoviebox,
   piexe: tryPiexe,
+  vidlink: tryVidlink,
+  yflix: tryYflix,
 };
 
 // ── Parallel Race: fire all, return the FIRST with sources ────────────────
@@ -352,6 +432,7 @@ export async function GET(request) {
       const refreshed = refreshVaultUrls(staleFallback);
       return Response.json({
         ...refreshed,
+        provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
         servers: SERVERS,
         cached: true,
         fallback: true,
