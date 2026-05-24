@@ -22,9 +22,35 @@ function _writeStore(store) {
   try { localStorage.setItem(STORAGE_KEY, JSON.stringify(store)); } catch { }
 }
 
-function _broadcast(store) {
+// ── Hex encoding for secure postMessage broadcasts ──────────────────────
+function _hexEncode(obj) {
+  return Array.from(new TextEncoder().encode(JSON.stringify(obj)))
+    .map(b => b.toString(16).padStart(2, '0')).join('');
+}
+
+export function hexDecode(hex) {
+  const bytes = new Uint8Array(hex.match(/.{2}/g).map(b => parseInt(b, 16)));
+  return JSON.parse(new TextDecoder().decode(bytes));
+}
+
+function _broadcast(store, currentKey) {
   if (typeof window === 'undefined') return;
-  try { window.parent.postMessage({ type: 'MEDIA_DATA', data: store }, '*'); } catch { }
+  try {
+    // Per-item update (frequent — every save tick)
+    if (currentKey && store[currentKey]) {
+      window.parent.postMessage({
+        type: 'MEDIA_PROGRESS',
+        data: _hexEncode({ [currentKey]: store[currentKey] }),
+        encoding: 'hex',
+      }, '*');
+    }
+    // Full store snapshot
+    window.parent.postMessage({
+      type: 'MEDIA_DATA',
+      data: _hexEncode(store),
+      encoding: 'hex',
+    }, '*');
+  } catch { }
 }
 
 function _enforceLimit(store) {
@@ -83,7 +109,7 @@ export function saveProgress(data) {
 
   _enforceLimit(store);
   _writeStore(store);
-  _broadcast(store);
+  _broadcast(store, key);
 }
 
 export function getProgress(type, id, season, episode) {

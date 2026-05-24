@@ -1,9 +1,12 @@
 "use client";
-import { useEffect, useRef, useState, useCallback } from "react";
-import { MediaPlayer, MediaProvider } from "@vidstack/react";
+import { useEffect, useRef, useState, useCallback, useMemo } from "react";
+import { MediaPlayer, MediaProvider, Menu } from "@vidstack/react";
 import {
   defaultLayoutIcons,
   DefaultVideoLayout,
+  DefaultMenuButton,
+  DefaultMenuSection,
+  DefaultMenuRadioGroup,
 } from "@vidstack/react/player/layouts/default";
 import "@vidstack/react/player/styles/default/theme.css";
 import "@vidstack/react/player/styles/default/layouts/video.css";
@@ -20,23 +23,193 @@ const SERVER_LABELS = {
   "sv-e5b7": { name: "Delta", color: "#f59e0b" },
 };
 
+// ── Vidstack-native icons ─────────────────────────────────────────────────
+
+// Provider/Server switch icon — matches Vidstack stroke style (settings-switch inspired)
+function ProviderIcon(props) {
+  return (
+    <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {...props}>
+      <path d="M7 10h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
+      <path d="M7 16h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
+      <path d="M7 22h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
+      <circle cx="12" cy="10" r="2.5" fill="currentColor"/>
+      <circle cx="22" cy="16" r="2.5" fill="currentColor"/>
+      <circle cx="15" cy="22" r="2.5" fill="currentColor"/>
+    </svg>
+  );
+}
+
+
+// Quality/resolution icon
+function QualityMenuIcon(props) {
+  return (
+    <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {...props}>
+      <rect x="4" y="6" width="24" height="16" rx="2" fill="currentColor"/>
+      <path d="M11.5 18V12l3.5 3-3.5 3z" fill="var(--media-brand, #000)" opacity=".8"/>
+      <text x="17" y="17" fontSize="7" fontWeight="700" fontFamily="sans-serif" fill="var(--media-brand, #000)" opacity=".8">HD</text>
+      <path d="M12 25h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M16 22v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+    </svg>
+  );
+}
+
+// ── Parse source labels into quality + dub components ────────────────────
+function parseSourceLabel(label) {
+  if (!label || label === "Default") return { quality: "Auto", dub: "Original" };
+
+  // Match patterns like "480p Original Audio", "1080p Arabic", "360p French"
+  const qualityMatch = label.match(/(\d{3,4}p)/i);
+  const quality = qualityMatch ? qualityMatch[1] : "Auto";
+
+  // Extract dub/language — everything after the quality, or the whole label if no quality
+  let dub = label;
+  if (qualityMatch) {
+    dub = label.replace(qualityMatch[0], "").trim();
+  }
+  // Clean up common patterns
+  dub = dub.replace(/^[\s-]+|[\s-]+$/g, "");
+  if (!dub || dub.toLowerCase() === "original audio") dub = "Original";
+
+  return { quality, dub };
+}
+
+
 export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const playerRef = useRef(null);
   const [sources, setSources] = useState([]);
   const sourcesRef = useRef(sources);
   const [subtitles, setSubtitles] = useState([]);
   const [currentServer, setCurrentServer] = useState(null);
+  const [currentSourceIndex, setCurrentSourceIndex] = useState(0);
   const [availableServers, setAvailableServers] = useState([]);
   const [error, setError] = useState(null);
   const [switching, setSwitching] = useState(null);
-  const [serverMenuOpen, setServerMenuOpen] = useState(false);
   const [failedServers, setFailedServers] = useState(new Set());
   const [meta, setMeta] = useState({ title: "", poster: "", backdrop: "" });
   const [devToolsBlocked, setDevToolsBlocked] = useState(false);
-  const [toast, setToast] = useState(null); // { message, type: 'error' | 'warn' }
+  const [toast, setToast] = useState(null);
 
   const progressRef = useRef({ time: 0, duration: 0 });
   const saveTimerRef = useRef(null);
+
+  // ── Current provider's sources ────────────────────────────────────────
+  const currentProviderSources = useMemo(() => {
+    if (!currentServer) return [];
+    return sources.filter(s => s.server === currentServer);
+  }, [sources, currentServer]);
+
+  // ── Helper: extract numeric quality for sorting ───────────────────────
+  const numericQuality = (q) => {
+    const m = q.match(/(\d+)/);
+    return m ? parseInt(m[1]) : 0; // "Auto" → 0
+  };
+
+  // ── Parse & split: Quality menu vs Audio/Dub menu ─────────────────────
+  const { qualityOptions, dubOptions, currentQuality, currentDub } = useMemo(() => {
+    if (currentProviderSources.length === 0) {
+      return { qualityOptions: [], dubOptions: [], currentQuality: "Auto", currentDub: "Original" };
+    }
+
+    // Parse all sources
+    const parsed = currentProviderSources.map((src, idx) => {
+      const { quality, dub } = parseSourceLabel(src.label);
+      return { ...src, _idx: idx, _quality: quality, _dub: dub };
+    });
+
+    // Get unique qualities and dubs
+    const qualitiesSet = new Map();
+    const dubsSet = new Map();
+
+    parsed.forEach(p => {
+      if (!qualitiesSet.has(p._quality)) qualitiesSet.set(p._quality, p._idx);
+      if (!dubsSet.has(p._dub)) dubsSet.set(p._dub, p._idx);
+    });
+
+    // For providers with "Server X" labels (vidcore/vidfast), treat them all as dubs
+    const hasServerLabels = parsed.every(p => /^Server\s+\d+$/i.test(p.label || ""));
+
+    let qualities = [];
+    let dubs = [];
+
+    if (hasServerLabels) {
+      // vidcore/vidfast: No quality separation, all go to dubs/servers
+      qualities = [{ label: "Auto", value: "Auto" }];
+      dubs = parsed.map(p => ({
+        label: p.label || `Server ${p._idx + 1}`,
+        value: String(p._idx),
+      }));
+    } else {
+      // moviebox/primesrc: Split by quality and dub
+      qualities = Array.from(qualitiesSet.entries()).map(([q]) => ({
+        label: q,
+        value: q,
+      }));
+      dubs = Array.from(dubsSet.entries()).map(([d]) => ({
+        label: d,
+        value: d,
+      }));
+    }
+
+    // Sort qualities numerically: 360p → 480p → 720p → 1080p (Auto last)
+    qualities.sort((a, b) => {
+      const na = numericQuality(a.label);
+      const nb = numericQuality(b.label);
+      if (na === 0 && nb === 0) return 0;
+      if (na === 0) return 1;  // "Auto" goes last
+      if (nb === 0) return -1;
+      return na - nb;
+    });
+
+    // Current selection
+    const activeParsed = parsed[currentSourceIndex] || parsed[0];
+    const curQuality = activeParsed?._quality || "Auto";
+    const curDub = activeParsed?._dub || "Original";
+
+    return {
+      qualityOptions: qualities,
+      dubOptions: dubs.length > 1 ? dubs : [],
+      currentQuality: curQuality,
+      currentDub: curDub,
+    };
+  }, [currentProviderSources, currentSourceIndex]);
+
+  // ── Quality/Dub switching — find matching source ──────────────────────
+  const switchQuality = useCallback((newQuality) => {
+    if (newQuality === currentQuality) return;
+    // Find a source matching new quality + current dub (or first match)
+    const match = currentProviderSources.findIndex(s => {
+      const { quality } = parseSourceLabel(s.label);
+      return quality === newQuality;
+    });
+    if (match >= 0) setCurrentSourceIndex(match);
+  }, [currentQuality, currentProviderSources]);
+
+  const switchDub = useCallback((newDub) => {
+    if (newDub === currentDub) return;
+
+    // For server-labeled sources, newDub is the index
+    const asIdx = Number(newDub);
+    if (!isNaN(asIdx) && asIdx >= 0 && asIdx < currentProviderSources.length) {
+      setCurrentSourceIndex(asIdx);
+      return;
+    }
+
+    // For quality+dub sources, find matching dub + current quality (or first match)
+    const match = currentProviderSources.findIndex(s => {
+      const { dub, quality } = parseSourceLabel(s.label);
+      return dub === newDub && quality === currentQuality;
+    });
+    if (match >= 0) {
+      setCurrentSourceIndex(match);
+    } else {
+      // Fallback: any source with this dub
+      const fallback = currentProviderSources.findIndex(s => {
+        const { dub } = parseSourceLabel(s.label);
+        return dub === newDub;
+      });
+      if (fallback >= 0) setCurrentSourceIndex(fallback);
+    }
+  }, [currentDub, currentQuality, currentProviderSources]);
 
   // ── DevTools Detection (from SiteGuard) ───────────────────────────────
   useEffect(() => {
@@ -73,8 +246,8 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   }, [id, type]);
 
   // ── Toast notification helper ────────────────────────────────────────
-  const showToast = useCallback((message, type = 'error') => {
-    setToast({ message, type });
+  const showToast = useCallback((message, toastType = 'error') => {
+    setToast({ message, type: toastType });
     setTimeout(() => setToast(null), 4000);
   }, []);
 
@@ -94,19 +267,16 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       if (data.servers) setAvailableServers(data.servers);
 
       if (!data.sources?.length) {
-        // Server switch failed — DON'T clear current stream
         if (server && sourcesRef.current.length > 0) {
           setFailedServers(prev => new Set([...prev, server]));
-          // Show a toast instead of replacing the player
           const msg = data.error || `${SERVER_LABELS[server]?.name || server} is unavailable`;
           showToast(msg, 'error');
           setSwitching(null);
-          return; // Keep current stream playing
+          return;
         }
         throw new Error(data.error || "No sources found");
       }
 
-      // Handle fallback responses (stale cache used when forced server failed)
       if (data.fallback && data.error) {
         showToast(data.error, 'warn');
       }
@@ -115,7 +285,19 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       sourcesRef.current = data.sources;
       setCurrentServer(data.provider);
 
-      // Fetch subtitles from our subs API if provider didn't return any
+      // Default to 480p (higher qualities like 720p/1080p get 429 rate-limited by upstream CDN)
+      const provSources = data.sources.filter(s => s.server === data.provider);
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      const TARGET_Q = 480;
+      provSources.forEach((s, i) => {
+        const m = (s.label || "").match(/(\d{3,4})p/i);
+        const q = m ? parseInt(m[1]) : 0;
+        const diff = Math.abs(q - TARGET_Q);
+        if (q > 0 && diff < bestDiff) { bestDiff = diff; bestIdx = i; }
+      });
+      setCurrentSourceIndex(bestIdx);
+
       if (!data.subtitles?.length) {
         fetchSubtitles();
       } else {
@@ -124,7 +306,6 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       setSwitching(null);
     } catch (err) {
       console.error("[VidzenPlayer] Source fetch failed:", err.message);
-      // Only show error overlay if we have NO current sources at all
       if (!sourcesRef.current.length) {
         setError(err.message);
       } else {
@@ -134,51 +315,72 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     }
   }, [type, id, season, episode, showToast]);
 
-  // ── Fetch subtitles from our /api/subs endpoint ─────────────────────────
+  // ── Fetch subtitles — FIX: was `tmdb_id`, API expects `id` ─────────────
   const fetchSubtitles = useCallback(async () => {
     try {
-      const params = new URLSearchParams({ tmdb_id: id, type });
+      const params = new URLSearchParams({ id, type });
       if (season) params.set("season", season);
       if (episode) params.set("episode", episode);
       const res = await fetch(`/api/subs?${params}`);
       if (res.ok) {
         const data = await res.json();
-        if (data?.subtitles?.length) setSubtitles(data.subtitles);
+        if (Array.isArray(data) && data.length) {
+          setSubtitles(data.map(s => ({
+            url: s.file || s.url,
+            lang: s.label || s.language || "Unknown",
+          })));
+        } else if (data?.subtitles?.length) {
+          setSubtitles(data.subtitles);
+        }
       }
     } catch { /* non-critical */ }
   }, [id, type, season, episode]);
 
   useEffect(() => { fetchSources(); }, [fetchSources]);
 
-  // ── Auto-clear failed servers after 2 minutes (transient 502s recover) ───
+  // ── Auto-clear failed servers after 2 minutes ───────────────────────────
   useEffect(() => {
     if (failedServers.size === 0) return;
     const timer = setTimeout(() => {
-      console.log("[VidzenPlayer] Auto-clearing failed servers (2m cooldown)");
       setFailedServers(new Set());
     }, 2 * 60 * 1000);
     return () => clearTimeout(timer);
   }, [failedServers]);
 
+  // ── Watch progress ──────────────────────────────────────────────────────
 
-  // ── Watch progress: save periodically ───────────────────────────────────
-  useEffect(() => {
-    saveTimerRef.current = setInterval(() => {
-      const { time, duration } = progressRef.current;
-      if (time > 0 && duration > 0) {
-        saveProgress({
-          type, id, season, episode,
-          watched: time, duration,
-          title: meta.title,
-          poster_path: meta.poster?.replace("https://image.tmdb.org/t/p/w780", "") || "",
-          backdrop_path: meta.backdrop?.replace("https://image.tmdb.org/t/p/w1280", "") || "",
-        });
-      }
-    }, SAVE_INTERVAL);
-    return () => clearInterval(saveTimerRef.current);
+  // Instant save helper — called before provider switch, on pause, tab close
+  const saveNow = useCallback(() => {
+    const { time, duration } = progressRef.current;
+    if (time > 0 && duration > 0) {
+      saveProgress({
+        type, id, season, episode,
+        watched: time, duration,
+        title: meta.title,
+        poster_path: meta.poster?.replace("https://image.tmdb.org/t/p/w780", "") || "",
+        backdrop_path: meta.backdrop?.replace("https://image.tmdb.org/t/p/w1280", "") || "",
+      });
+    }
   }, [type, id, season, episode, meta]);
 
-  // ── Watch progress: restore on mount ────────────────────────────────────
+  // Periodic save (every 5s)
+  useEffect(() => {
+    saveTimerRef.current = setInterval(saveNow, SAVE_INTERVAL);
+    return () => clearInterval(saveTimerRef.current);
+  }, [saveNow]);
+
+  // Save on tab close / tab background — zero progress loss
+  useEffect(() => {
+    const onUnload = () => saveNow();
+    const onVisChange = () => { if (document.hidden) saveNow(); };
+    window.addEventListener('beforeunload', onUnload);
+    document.addEventListener('visibilitychange', onVisChange);
+    return () => {
+      window.removeEventListener('beforeunload', onUnload);
+      document.removeEventListener('visibilitychange', onVisChange);
+    };
+  }, [saveNow]);
+
   const handleCanPlay = useCallback(() => {
     const saved = getProgress(type, id, season, episode);
     if (saved && saved.watched > 15 && playerRef.current) {
@@ -186,39 +388,30 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     }
   }, [type, id, season, episode]);
 
-  // ── Track playback time ─────────────────────────────────────────────────
   const handleTimeUpdate = useCallback((detail) => {
     progressRef.current.time = detail.currentTime;
     progressRef.current.duration = detail.duration;
   }, []);
 
-  // ── Handle playback errors → try next server ───────────────────────────
   const handleError = useCallback(() => {
-    console.warn("[VidzenPlayer] Playback error on server:", currentServer);
     if (!currentServer) return;
     setFailedServers(prev => new Set([...prev, currentServer]));
     const remaining = availableServers.filter(
       s => s !== currentServer && !failedServers.has(s)
     );
-    if (remaining.length > 0) {
-      console.log("[VidzenPlayer] Falling back to:", remaining[0]);
-      fetchSources(remaining[0]);
-    }
+    if (remaining.length > 0) fetchSources(remaining[0]);
   }, [currentServer, availableServers, failedServers, fetchSources]);
 
-  // ── Switch server manually ──────────────────────────────────────────────
   const switchServer = useCallback((server) => {
     if (server === currentServer) return;
-    setServerMenuOpen(false);
+    saveNow();  // Save progress BEFORE switching — no seconds lost
     fetchSources(server);
-  }, [currentServer, fetchSources]);
+  }, [currentServer, fetchSources, saveNow]);
 
-  // ── Safely handle autoplay failures (browser policy) ────────────────────
   const handlePlay = useCallback(() => {
     if (!playerRef.current) return;
     playerRef.current.play().catch((err) => {
       if (err.name === "NotAllowedError") {
-        // Browser blocked autoplay — retry muted
         playerRef.current.muted = true;
         playerRef.current.play().catch(() => {});
       }
@@ -226,13 +419,11 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   }, []);
 
   // ── Build Vidstack src ──────────────────────────────────────────────────
-  // CRITICAL: Never pass empty string "" to <MediaPlayer src=...>
-  // That destroys Vidstack's internal state machine ($state) and causes
-  // "this.$state[prop2] is not a function" crash.
-  const hasSources = sources.length > 0;
-  const playerSrc = hasSources ? sources[0].url : undefined;
-  const playerType = hasSources
-    ? (sources[0].type === "hls" || sources[0].url?.includes(".m3u8")
+  const hasSources = currentProviderSources.length > 0;
+  const activeSource = hasSources ? currentProviderSources[currentSourceIndex] || currentProviderSources[0] : null;
+  const playerSrc = activeSource?.url;
+  const playerType = activeSource
+    ? (activeSource.type === "hls" || activeSource.url?.includes(".m3u8")
       ? "application/x-mpegurl"
       : "video/mp4")
     : "video/mp4";
@@ -241,13 +432,88 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     ? `${meta.title} S${season}E${episode}`
     : meta.title || "";
 
-  // ── Only show error if ALL providers failed AND we have no sources ──────
   const showError = error && !hasSources;
+
+  // ── Build layout slots with proper drill-down submenus ────────────────
+
+  // Provider popup — SEPARATE button in the control bar (via airPlayButton slot)
+  // Uses Menu.Root + Menu.Button for a standalone popup, NOT inside settings
+  const ProviderButton = useMemo(() => {
+    if (availableServers.length === 0) return null;
+    return (
+      <Menu.Root className="vds-provider-menu vds-menu">
+        <Menu.Button className="vds-button" aria-label="Switch Provider">
+          <ProviderIcon className="vds-icon" style={{ width: 26, height: 26 }} />
+        </Menu.Button>
+        <Menu.Content className="vds-menu-items" placement="top end">
+          <DefaultMenuRadioGroup
+            value={currentServer || ""}
+            options={availableServers.map(server => {
+              const info = SERVER_LABELS[server] || { name: server };
+              const isFailed = failedServers.has(server);
+              return {
+                label: isFailed ? `${info.name} (unavailable)` : info.name,
+                value: server,
+              };
+            })}
+            onChange={(newVal) => {
+              if (!failedServers.has(newVal)) switchServer(newVal);
+            }}
+          />
+        </Menu.Content>
+      </Menu.Root>
+    );
+  }, [availableServers, currentServer, failedServers, switchServer]);
+
+  // Quality submenu — ALWAYS shows, even with 1 option like "Auto"
+  // Sorted: 360p → 480p → 720p → 1080p
+  const QualitySubmenu = useMemo(() => {
+    if (qualityOptions.length < 1) return null;
+    return (
+      <Menu.Root className="vds-quality-menu vds-menu">
+        <DefaultMenuButton label="Quality" hint={currentQuality} Icon={QualityMenuIcon} />
+        <Menu.Content className="vds-menu-items">
+          <DefaultMenuRadioGroup
+            value={currentQuality}
+            options={qualityOptions}
+            onChange={switchQuality}
+          />
+        </Menu.Content>
+      </Menu.Root>
+    );
+  }, [qualityOptions, currentQuality, switchQuality]);
+
+  // Dub/Server items for Audio menu (only language dubs, no quality info)
+  const AudioDubSlot = useMemo(() => {
+    if (dubOptions.length === 0) return null;
+    return (
+      <DefaultMenuSection label="Servers / Dubs">
+        <DefaultMenuRadioGroup
+          value={currentProviderSources.every(s => /^Server\s+\d+$/i.test(s.label || ""))
+            ? String(currentSourceIndex)
+            : currentDub
+          }
+          options={dubOptions}
+          onChange={switchDub}
+        />
+      </DefaultMenuSection>
+    );
+  }, [dubOptions, currentDub, currentSourceIndex, currentProviderSources, switchDub]);
+
+  // Combine all slots
+  const layoutSlots = useMemo(() => ({
+    // Quality goes inside settings menu as a drill-down submenu
+    settingsMenuItemsStart: QualitySubmenu,
+    // Dub/server items inside audio menu
+    audioMenuItemsEnd: AudioDubSlot,
+    // Provider button replaces the unused AirPlay button in the control bar
+    airPlayButton: ProviderButton,
+  }), [QualitySubmenu, AudioDubSlot, ProviderButton]);
 
   return (
     <div style={styles.wrapper}>
-      {/* Always render the player — Vidstack shows poster + buffering natively */}
       <MediaPlayer
+        key={currentServer || "init"}
         ref={playerRef}
         src={hasSources ? { src: playerSrc, type: playerType } : ""}
         title={displayTitle}
@@ -261,6 +527,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
           handlePlay();
         }}
         onTimeUpdate={handleTimeUpdate}
+        onPause={saveNow}
         onError={handleError}
         style={{ width: "100%", height: "100%" }}
       >
@@ -276,7 +543,10 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
             />
           ))}
         </MediaProvider>
-        <DefaultVideoLayout icons={defaultLayoutIcons} />
+        <DefaultVideoLayout
+          icons={defaultLayoutIcons}
+          slots={layoutSlots}
+        />
       </MediaPlayer>
 
       {/* DevTools blocking overlay */}
@@ -299,7 +569,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         </div>
       )}
 
-      {/* Server switching overlay — shows over the player while loading */}
+      {/* Server switching overlay */}
       {switching && (
         <div style={styles.switchOverlay}>
           <div style={styles.switchSpinner} />
@@ -307,7 +577,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         </div>
       )}
 
-      {/* Error overlay — only when no sources at all */}
+      {/* Error overlay */}
       {showError && (
         <div style={styles.errorOverlay}>
           <svg width="36" height="36" viewBox="0 0 24 24" fill="none" stroke="#ef4444" strokeWidth="2">
@@ -322,7 +592,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         </div>
       )}
 
-      {/* Toast notification (server switch failures, fallback warnings) */}
+      {/* Toast */}
       {toast && (
         <div style={{
           ...styles.toast,
@@ -333,55 +603,6 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
           <span style={styles.toastText}>{toast.message}</span>
         </div>
       )}
-
-      {/* Server Picker */}
-      <div style={styles.serverBtnContainer}>
-        <button
-          style={styles.serverBtn}
-          onClick={() => setServerMenuOpen(!serverMenuOpen)}
-          title="Switch Server"
-        >
-          <svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
-            <rect x="2" y="2" width="20" height="8" rx="2" ry="2" /><rect x="2" y="14" width="20" height="8" rx="2" ry="2" />
-            <line x1="6" y1="6" x2="6.01" y2="6" /><line x1="6" y1="18" x2="6.01" y2="18" />
-          </svg>
-          <span style={styles.serverBtnLabel}>
-            {currentServer ? (SERVER_LABELS[currentServer]?.name || currentServer) : "..."}
-          </span>
-        </button>
-
-        {serverMenuOpen && (
-          <div style={styles.serverMenu}>
-            {availableServers.map(server => {
-              const info = SERVER_LABELS[server] || { name: server, color: "#888" };
-              const isActive = server === currentServer;
-              const isFailed = failedServers.has(server);
-              return (
-                <button
-                  key={server}
-                  style={{
-                    ...styles.serverMenuItem,
-                    opacity: isFailed ? 0.4 : 1,
-                    cursor: isFailed ? "not-allowed" : "pointer",
-                    background: isActive ? "rgba(255,255,255,0.1)" : "transparent",
-                  }}
-                  onClick={() => !isFailed && switchServer(server)}
-                  disabled={isFailed}
-                >
-                  <span style={{
-                    ...styles.serverDot,
-                    background: isActive ? info.color : isFailed ? "#555" : info.color + "80",
-                    boxShadow: isActive ? `0 0 8px ${info.color}` : "none",
-                  }} />
-                  <span style={styles.serverName}>{info.name}</span>
-                  {isActive && <span style={styles.serverActive}>●</span>}
-                  {isFailed && <span style={styles.serverFailed}>✗</span>}
-                </button>
-              );
-            })}
-          </div>
-        )}
-      </div>
     </div>
   );
 }
@@ -449,78 +670,6 @@ const styles = {
     fontSize: "13px",
     fontFamily: "'Inter', -apple-system, sans-serif",
     transition: "all 0.2s",
-  },
-  serverBtnContainer: {
-    position: "absolute",
-    top: "12px",
-    right: "12px",
-    zIndex: 50,
-  },
-  serverBtn: {
-    display: "flex",
-    alignItems: "center",
-    gap: "6px",
-    padding: "6px 12px",
-    background: "rgba(0,0,0,0.7)",
-    backdropFilter: "blur(8px)",
-    border: "1px solid rgba(255,255,255,0.1)",
-    borderRadius: "6px",
-    color: "rgba(255,255,255,0.9)",
-    cursor: "pointer",
-    fontSize: "12px",
-    fontFamily: "'Inter', -apple-system, sans-serif",
-    transition: "all 0.2s",
-  },
-  serverBtnLabel: {
-    fontWeight: 500,
-  },
-  serverMenu: {
-    position: "absolute",
-    top: "calc(100% + 6px)",
-    right: 0,
-    minWidth: "160px",
-    background: "rgba(10,10,10,0.95)",
-    backdropFilter: "blur(12px)",
-    border: "1px solid rgba(255,255,255,0.1)",
-    borderRadius: "8px",
-    padding: "4px",
-    display: "flex",
-    flexDirection: "column",
-    gap: "2px",
-    boxShadow: "0 8px 32px rgba(0,0,0,0.5)",
-  },
-  serverMenuItem: {
-    display: "flex",
-    alignItems: "center",
-    gap: "8px",
-    padding: "8px 12px",
-    border: "none",
-    borderRadius: "6px",
-    color: "rgba(255,255,255,0.85)",
-    fontSize: "13px",
-    fontFamily: "'Inter', -apple-system, sans-serif",
-    transition: "all 0.15s",
-    textAlign: "left",
-    width: "100%",
-  },
-  serverDot: {
-    width: "8px",
-    height: "8px",
-    borderRadius: "50%",
-    flexShrink: 0,
-  },
-  serverName: {
-    flex: 1,
-    fontWeight: 500,
-  },
-  serverActive: {
-    color: "#22c55e",
-    fontSize: "10px",
-  },
-  serverFailed: {
-    color: "#ef4444",
-    fontSize: "12px",
-    fontWeight: "bold",
   },
   toast: {
     position: "absolute",

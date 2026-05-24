@@ -3,7 +3,7 @@
 // Set SUBS_WORKER_URL=https://subs.vidzen.fun in .env.local after deploying the worker
 export const runtime = "nodejs";
 
-const WORKER_URL = process.env.SUBS_WORKER_URL || "https://subs.vidzen.fun";
+const WORKER_URL = process.env.SUBS_WORKER_URL || "https://vidzen-subs.mds519207.workers.dev";
 const TIMEOUT_MS = 10_000;
 
 async function safeFetch(url, opts = {}) {
@@ -56,7 +56,8 @@ export async function GET(request) {
   }
 
   // ── Subtitle search (/api/subs?id=...) ────────────────────────────────────
-  const id = searchParams.get("id");
+  // Accept both `id` and `tmdb_id` for backward compatibility
+  const id = searchParams.get("id") || searchParams.get("tmdb_id");
   if (!id) {
     return new Response(JSON.stringify({ error: "Missing ?id=" }), {
       status: 400,
@@ -64,11 +65,11 @@ export async function GET(request) {
     });
   }
 
-  const season  = searchParams.get("season")  || "";
+  const season = searchParams.get("season") || "";
   const episode = searchParams.get("episode") || "";
 
   const params = new URLSearchParams({ id });
-  if (season)  params.set("season",  season);
+  if (season) params.set("season", season);
   if (episode) params.set("episode", episode);
 
   const workerSearchUrl = `${WORKER_URL}/search?${params}`;

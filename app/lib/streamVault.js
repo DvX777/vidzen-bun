@@ -4,17 +4,19 @@
 
 import crypto from "crypto";
 
-const VAULT_TTL_MS = 2 * 60 * 60 * 1000; // 2 hours
+const VAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours (was 2h — segments need longer life)
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 
 // ── In-memory store: id → { url, origin, referer, expiresAt } ───────────
-const store = new Map();
+// Use globalThis to survive Next.js dev-mode hot-module-reloads.
+// Without this, every file save wipes the Map → instant 404s for all active streams.
+const store = globalThis.__streamVault ??= new Map();
+if (!globalThis.__streamVault) globalThis.__streamVault = store;
 
 // ── Auto-cleanup expired entries ────────────────────────────────────────
-let cleanupStarted = false;
 function ensureCleanup() {
-  if (cleanupStarted) return;
-  cleanupStarted = true;
+  if (globalThis.__streamVaultCleanup) return;
+  globalThis.__streamVaultCleanup = true;
   setInterval(() => {
     const now = Date.now();
     let cleaned = 0;
@@ -55,6 +57,8 @@ export function resolveUrl(id) {
     store.delete(id);
     return null;
   }
+  // Touch-on-read: extend TTL while stream is actively being used
+  entry.expiresAt = Date.now() + VAULT_TTL_MS;
   return { url: entry.url, origin: entry.origin, referer: entry.referer };
 }
 
