@@ -385,6 +385,8 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   }, [saveNow]);
 
   const handleCanPlay = useCallback(() => {
+    // Reset error counter — playback succeeded
+    errorCountRef.current = 0;
     const saved = getProgress(type, id, season, episode);
     if (saved && saved.watched > 15 && playerRef.current) {
       playerRef.current.currentTime = saved.watched;
@@ -396,13 +398,34 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     progressRef.current.duration = detail.duration;
   }, []);
 
+  const errorCountRef = useRef(0);
+  const lastErrorTimeRef = useRef(0);
+
   const handleError = useCallback(() => {
     if (!currentServer) return;
+
+    // Debounce: ignore rapid-fire errors (HLS fires multiple for same failure)
+    const now = Date.now();
+    if (now - lastErrorTimeRef.current < 2000) return;
+    lastErrorTimeRef.current = now;
+
+    errorCountRef.current++;
+    // Stop auto-switching after 3 consecutive errors (prevents infinite loop)
+    if (errorCountRef.current > 3) {
+      console.warn("[VidzenPlayer] Too many errors, stopping auto-switch");
+      setError("Unable to load stream. Please try a different server.");
+      return;
+    }
+
     setFailedServers(prev => new Set([...prev, currentServer]));
     const remaining = availableServers.filter(
       s => s !== currentServer && !failedServers.has(s)
     );
-    if (remaining.length > 0) fetchSources(remaining[0]);
+    if (remaining.length > 0) {
+      fetchSources(remaining[0]);
+    } else {
+      setError("All servers are currently unavailable. Please try again later.");
+    }
   }, [currentServer, availableServers, failedServers, fetchSources]);
 
   const switchServer = useCallback((server) => {

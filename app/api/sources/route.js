@@ -436,16 +436,23 @@ export async function GET(request) {
     const raceCacheKey = sourceKey(type, id, null, season, episode);
     const staleFallback = await cacheGet(raceCacheKey);
     if (staleFallback?.sources?.length) {
-      console.log(`[sources] ${forcedServer} failed but found stale race cache — using fallback`);
       const refreshed = refreshVaultUrls(staleFallback);
-      return Response.json({
-        ...refreshed,
-        provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
-        servers: SERVERS,
-        cached: true,
-        fallback: true,
-        error: `${maskName(forcedServer)} is temporarily unavailable — showing cached results`,
-      }, { headers: { "Cache-Control": "no-store" } });
+      // Only use fallback if vault URLs are alive (refreshed successfully)
+      const firstRefreshedUrl = refreshed.sources?.[0]?.url;
+      if (firstRefreshedUrl?.startsWith("/api/stream/")) {
+        const testId = firstRefreshedUrl.split("/").pop();
+        if (resolveUrl(testId)) {
+          console.log(`[sources] ${forcedServer} failed but found live stale cache — using fallback`);
+          return Response.json({
+            ...refreshed,
+            provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
+            servers: SERVERS,
+            cached: true,
+            fallback: true,
+          }, { headers: { "Cache-Control": "no-store" } });
+        }
+      }
+      console.log(`[sources] Stale fallback has dead vault URLs — skipping`);
     }
 
     // Distinguish error type for the client
