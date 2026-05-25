@@ -4,7 +4,7 @@
 
 export const runtime = "nodejs";
 
-import { vaultUrl } from "@/lib/streamVault";
+import { vaultUrl, resolveUrl } from "@/lib/streamVault";
 import { cacheGet, cacheSet, sourceKey, DEFAULT_TTL, DEMO_TTL, NOT_FOUND_TTL } from "@/lib/redisCache";
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
@@ -366,14 +366,36 @@ export async function GET(request) {
   const cacheKey = sourceKey(type, id, forcedServer, season, episode);
   const cached = await cacheGet(cacheKey);
   if (cached) {
-    console.log(`[sources] CACHE HIT: ${cacheKey}`);
-    // Re-vault the URLs (vault IDs may have expired)
+    // Re-vault cached URLs (creates fresh in-memory vault entries from stored raw URLs)
     const refreshed = refreshVaultUrls(cached);
-    return Response.json({
-      ...refreshed,
-      servers: SERVERS,
-      cached: true,
-    }, { headers: { "Cache-Control": "no-store" } });
+
+    // Check if re-vaulting worked (old cache without _raw data can't be refreshed)
+    const firstUrl = refreshed.sources?.[0]?.url;
+    if (firstUrl && firstUrl.startsWith("/api/stream/")) {
+      const vaultId = firstUrl.split("/").pop();
+      if (!resolveUrl(vaultId)) {
+        // Cache has old-format data (no _raw) with dead vault IDs — skip, refetch
+        console.log(`[sources] CACHE STALE (no raw URLs): ${cacheKey} — refetching`);
+        // Fall through to fresh fetch below
+      } else {
+        console.log(`[sources] CACHE HIT: ${cacheKey}`);
+        return Response.json({
+          ...refreshed,
+          provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
+          servers: SERVERS,
+          cached: true,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
+    } else {
+      // Non-vault URLs (shouldn't happen normally) — return as-is
+      console.log(`[sources] CACHE HIT: ${cacheKey}`);
+      return Response.json({
+        ...refreshed,
+        provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
+        servers: SERVERS,
+        cached: true,
+      }, { headers: { "Cache-Control": "no-store" } });
+    }
   }
 
   // ── Forced server (with retry + stale cache fallback) ─────────────────
@@ -422,14 +444,14 @@ export async function GET(request) {
         servers: SERVERS,
         cached: true,
         fallback: true,
-        error: `${forcedServer} is temporarily unavailable — showing cached results`,
+        error: `${maskName(forcedServer)} is temporarily unavailable — showing cached results`,
       }, { headers: { "Cache-Control": "no-store" } });
     }
 
     // Distinguish error type for the client
     const errorMsg = lastError?.includes("502") || lastError?.includes("timed out")
-      ? `${forcedServer} is temporarily unreachable (server issue)`
-      : `${forcedServer} returned no sources`;
+      ? `${maskName(forcedServer)} is temporarily unreachable (server issue)`
+      : `${maskName(forcedServer)} returned no sources`;
 
     await cacheSet(cacheKey, { sources: [], subtitles: [], provider: null, error: errorMsg }, NOT_FOUND_TTL);
     return Response.json({
@@ -460,26 +482,57 @@ export async function GET(request) {
 }
 
 // ── Helpers for cache ─────────────────────────────────────────────────────
-// We can't cache vault URLs directly (they expire from memory).
-// Instead, cache the RAW provider URLs and re-vault on cache hit.
+// Vault URLs are ephemeral (in-memory, die on restart).
+// Redis is persistent (survives restarts).
+// Fix: cache RAW CDN URLs + metadata → re-vault on cache hit.
 
 function stripVaultForCache(result) {
-  // Store original URLs (before vaulting) for cache
-  // Since the vault URLs are already generated, we need to store the result as-is
-  // and re-vault on retrieval. For simplicity, we cache with vault URLs
-  // but refresh them on cache hit.
+  const sources = (result.sources || []).map(s => {
+    // Resolve vault URL back to raw CDN URL + metadata
+    if (s.url?.startsWith("/api/stream/")) {
+      const vaultId = s.url.split("/").pop();
+      const entry = resolveUrl(vaultId);
+      if (entry) {
+        return {
+          ...s,
+          url: s.url,            // Keep vault URL for immediate use
+          _raw: entry.url,       // Store raw CDN URL for cache
+          _origin: entry.origin,
+          _referer: entry.referer,
+          _cfProxy: entry.cfProxy || null,
+        };
+      }
+    }
+    return s;
+  });
+
   return {
     provider: result.provider,
-    sources: result.sources,
+    sources,
     subtitles: result.subtitles || [],
   };
 }
 
 function refreshVaultUrls(cached) {
-  // The cached URLs are already vaulted — but vault entries may have expired.
-  // Since we cache for 1-2 hours and vault TTL is also 2 hours, this is fine.
-  // The /api/stream/[id] endpoint handles 404 for expired vault entries gracefully.
-  return cached;
+  const sources = (cached.sources || []).map(s => {
+    // If raw URL is stored, re-vault it (creates fresh in-memory entry)
+    if (s._raw) {
+      const freshVaultUrl = vaultUrl(s._raw, {
+        origin: s._origin || null,
+        referer: s._referer || null,
+        cfProxy: s._cfProxy || null,
+      });
+      // Return source with fresh vault URL, strip raw metadata
+      const { _raw, _origin, _referer, _cfProxy, ...rest } = s;
+      return { ...rest, url: freshVaultUrl };
+    }
+    return s;
+  });
+
+  return {
+    ...cached,
+    sources,
+  };
 }
 
 export async function OPTIONS() {

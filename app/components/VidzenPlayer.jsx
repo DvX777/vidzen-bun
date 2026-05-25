@@ -270,8 +270,9 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
 
       if (!data.sources?.length) {
         if (server && sourcesRef.current.length > 0) {
+          const serverName = SERVER_LABELS[server]?.name || server;
           setFailedServers(prev => new Set([...prev, server]));
-          const msg = data.error || `${SERVER_LABELS[server]?.name || server} is unavailable`;
+          const msg = `${serverName} is unavailable`;
           showToast(msg, 'error');
           setSwitching(null);
           return;
