@@ -304,9 +304,14 @@ const PROVIDER_MAP = {
   yflix: tryYflix,
 };
 
+// Providers excluded from the automatic race (but still available via forced server switch).
+// VidLink: storm.vodvidl.site blocks datacenter + CF Worker IPs (only residential works).
+// Including it in the race poisons the cache with 403-producing sources.
+const RACE_EXCLUDED = new Set(["vidlink"]);
+
 // ── Parallel Race: fire all, return the FIRST with sources ────────────────
 async function raceProviders(type, id, season, episode) {
-  const entries = Object.entries(PROVIDER_MAP);
+  const entries = Object.entries(PROVIDER_MAP).filter(([name]) => !RACE_EXCLUDED.has(name));
 
   const racers = entries.map(([name, fn]) => {
     return fn(type, id, season, episode)
