@@ -7,7 +7,7 @@ import crypto from "crypto";
 const VAULT_TTL_MS = 4 * 60 * 60 * 1000; // 4 hours (was 2h — segments need longer life)
 const CLEANUP_INTERVAL_MS = 5 * 60 * 1000; // 5 min
 
-// ── In-memory store: id → { url, origin, referer, expiresAt } ───────────
+// ── In-memory store: id → { url, origin, referer, cfProxy, expiresAt } ──
 // Use globalThis to survive Next.js dev-mode hot-module-reloads.
 // Without this, every file save wipes the Map → instant 404s for all active streams.
 const store = globalThis.__streamVault ??= new Map();
@@ -34,13 +34,14 @@ function ensureCleanup() {
  * Store a real URL behind an opaque ID.
  * @returns {string} opaque hex ID (8 chars)
  */
-export function storeUrl(url, { origin = null, referer = null } = {}) {
+export function storeUrl(url, { origin = null, referer = null, cfProxy = null } = {}) {
   ensureCleanup();
   const id = crypto.randomBytes(4).toString("hex"); // 8-char hex
   store.set(id, {
     url,
     origin,
     referer,
+    cfProxy,    // CF Worker URL for datacenter-blocked CDNs (e.g. VidLink)
     expiresAt: Date.now() + VAULT_TTL_MS,
   });
   return id;
@@ -59,7 +60,7 @@ export function resolveUrl(id) {
   }
   // Touch-on-read: extend TTL while stream is actively being used
   entry.expiresAt = Date.now() + VAULT_TTL_MS;
-  return { url: entry.url, origin: entry.origin, referer: entry.referer };
+  return { url: entry.url, origin: entry.origin, referer: entry.referer, cfProxy: entry.cfProxy };
 }
 
 /**

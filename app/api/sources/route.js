@@ -8,6 +8,7 @@ import { vaultUrl } from "@/lib/streamVault";
 import { cacheGet, cacheSet, sourceKey, DEFAULT_TTL, DEMO_TTL, NOT_FOUND_TTL } from "@/lib/redisCache";
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
+const CF_STREAM_PROXY = process.env.CF_STREAM_PROXY || "https://vidzen-stream-proxy.xdbypass.workers.dev";
 
 // ── Provider name obfuscation ─────────────────────────────────────────────
 // Internal names → hex IDs (network tab won't reveal provider names)
@@ -223,12 +224,16 @@ function normalizeVidlink(data) {
           const hdrs = JSON.parse(parsed.searchParams.get("headers") || "{}");
           if (hdrs.origin) vaultOrigin = hdrs.origin;
           if (hdrs.referer) vaultReferer = hdrs.referer;
-        } catch {}
+        } catch { }
       }
-    } catch {}
+    } catch { }
 
     return {
-      url: vaultUrl(finalUrl, { origin: vaultOrigin, referer: vaultReferer }),
+      url: vaultUrl(finalUrl, {
+        origin: vaultOrigin,
+        referer: vaultReferer,
+        cfProxy: CF_STREAM_PROXY || null,  // Route through CF Worker on production
+      }),
       type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
       label: s.quality || s.server || "Auto",
       server: maskName("vidlink"),

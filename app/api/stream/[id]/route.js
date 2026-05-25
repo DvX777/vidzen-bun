@@ -36,19 +36,20 @@ function unwrapVpsProxyUrl(url) {
 }
 
 // ── Vault a URL, unwrapping VPS proxy URLs first ────────────────────────
-function smartVault(absUrl, fallbackOrigin, fallbackReferer) {
+function smartVault(absUrl, fallbackOrigin, fallbackReferer, cfProxy = null) {
   const unwrapped = unwrapVpsProxyUrl(absUrl);
   if (unwrapped) {
     return vaultUrl(unwrapped.url, {
       origin: unwrapped.origin,
       referer: unwrapped.referer,
+      cfProxy,
     });
   }
-  return vaultUrl(absUrl, { origin: fallbackOrigin, referer: fallbackReferer });
+  return vaultUrl(absUrl, { origin: fallbackOrigin, referer: fallbackReferer, cfProxy });
 }
 
 // ── Rewrite M3U8 segment URLs into new vault IDs ────────────────────────
-async function rewriteM3U8(body, baseUrl, origin, referer) {
+async function rewriteM3U8(body, baseUrl, origin, referer, cfProxy = null) {
   const base = new URL(baseUrl);
   const lines = body.split("\n");
   const result = [];
@@ -73,7 +74,7 @@ async function rewriteM3U8(body, baseUrl, origin, referer) {
         let absUrl;
         try { absUrl = uri.startsWith("http") ? uri : new URL(uri, base).href; }
         catch { return match; }
-        return `URI="${smartVault(absUrl, origin, referer)}"`;
+        return `URI="${smartVault(absUrl, origin, referer, cfProxy)}"`;
       });
       result.push(rewritten);
       continue;
@@ -84,7 +85,7 @@ async function rewriteM3U8(body, baseUrl, origin, referer) {
       let absUrl;
       try { absUrl = trimmed.startsWith("http") ? trimmed : new URL(trimmed, base).href; }
       catch { result.push(line); continue; }
-      result.push(smartVault(absUrl, origin, referer));
+      result.push(smartVault(absUrl, origin, referer, cfProxy));
       continue;
     }
 
@@ -108,7 +109,12 @@ export async function GET(request, { params }) {
     });
   }
 
-  const { url, origin, referer } = entry;
+  const { url, origin, referer, cfProxy } = entry;
+
+  // ── Route through CF Worker if cfProxy is set (datacenter-blocked CDNs) ──
+  const fetchUrl = cfProxy
+    ? `${cfProxy}/p?url=${encodeURIComponent(url)}`
+    : url;
 
   // ── Build upstream headers ──────────────────────────────────────────
   const upstreamHeaders = { "User-Agent": UA };
@@ -125,9 +131,9 @@ export async function GET(request, { params }) {
   if (rangeHeader) upstreamHeaders["Range"] = rangeHeader;
 
   try {
-    console.log(`[Stream] Fetching: ${url.substring(0, 120)}...`);
-    const upstreamRes = await fetch(url, {
-      headers: upstreamHeaders,
+    console.log(`[Stream] Fetching${cfProxy ? ' (via CF)' : ''}: ${url.substring(0, 120)}...`);
+    const upstreamRes = await fetch(fetchUrl, {
+      headers: cfProxy ? { "User-Agent": UA } : upstreamHeaders,  // CF Worker handles origin/referer
       redirect: "follow",
     });
 
@@ -145,7 +151,7 @@ export async function GET(request, { params }) {
       url.includes(".m3u8")
     ) {
       const body = await upstreamRes.text();
-      const rewritten = await rewriteM3U8(body, url, origin, referer);
+      const rewritten = await rewriteM3U8(body, url, origin, referer, cfProxy);
       return new Response(rewritten, {
         status: 200,
         headers: {
