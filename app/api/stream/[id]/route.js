@@ -112,9 +112,17 @@ export async function GET(request, { params }) {
   const { url, origin, referer, cfProxy } = entry;
 
   // ── Route through CF Worker if cfProxy is set (datacenter-blocked CDNs) ──
-  const fetchUrl = cfProxy
-    ? `${cfProxy}/p?url=${encodeURIComponent(url)}`
-    : url;
+  if (cfProxy) {
+    const fetchUrl = `${cfProxy}/p?url=${encodeURIComponent(url)}`;
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": fetchUrl,
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
 
   // ── Build upstream headers ──────────────────────────────────────────
   const upstreamHeaders = { "User-Agent": UA };
@@ -131,9 +139,9 @@ export async function GET(request, { params }) {
   if (rangeHeader) upstreamHeaders["Range"] = rangeHeader;
 
   try {
-    console.log(`[Stream] Fetching${cfProxy ? ' (via CF)' : ''}: ${url.substring(0, 120)}...`);
-    const upstreamRes = await fetch(fetchUrl, {
-      headers: cfProxy ? { "User-Agent": UA } : upstreamHeaders,  // CF Worker handles origin/referer
+    console.log(`[Stream] Fetching: ${url.substring(0, 120)}...`);
+    const upstreamRes = await fetch(url, {
+      headers: upstreamHeaders,
       redirect: "follow",
     });
 
