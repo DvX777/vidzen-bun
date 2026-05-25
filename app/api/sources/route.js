@@ -202,37 +202,18 @@ function normalizeVidlink(data) {
   if (data?.success === false || payload?.error) return null;
   if (!payload?.sources?.length) return null;
   const sources = payload.sources.map(s => {
-    // storm.vodvidl.site is a CORS proxy behind Cloudflare (blocks all server IPs).
-    // URL format: https://storm.vodvidl.site/proxy/PATH.m3u8?headers=...&host=REAL_HOST
-    // Fix: bypass storm → construct direct URL to the real host (e.g. aurorabird6.live)
-    // Then vault with videostr.net headers (required by the real host, verified 200 OK).
+    // storm.vodvidl.site is VidLink's own CORS proxy.
+    // It only checks Origin header (must be vidlink.pro), NOT the client IP.
+    // Strategy: keep the storm URL as-is, route through our CF Worker.
+    // CF Worker sets Origin: vidlink.pro → storm accepts → fetches from real CDN.
+    // This works from any IP (VPS, Vercel, consumer) because storm doesn't block IPs.
     const decodedUrl = decodeURIComponent(s.url);
-    let finalUrl = decodedUrl;
-    let vaultOrigin = "https://videostr.net";
-    let vaultReferer = "https://videostr.net/";
-
-    try {
-      const parsed = new URL(decodedUrl);
-      if (parsed.hostname.includes("vodvidl.site") && parsed.pathname.startsWith("/proxy/")) {
-        const path = parsed.pathname.replace(/^\/proxy\//, "");
-        const realHost = parsed.searchParams.get("host");
-        if (realHost && path) {
-          finalUrl = `${realHost.replace(/\/$/, "")}/${path}`;
-        }
-        // Extract headers from query if available
-        try {
-          const hdrs = JSON.parse(parsed.searchParams.get("headers") || "{}");
-          if (hdrs.origin) vaultOrigin = hdrs.origin;
-          if (hdrs.referer) vaultReferer = hdrs.referer;
-        } catch { }
-      }
-    } catch { }
 
     return {
-      url: vaultUrl(finalUrl, {
-        origin: vaultOrigin,
-        referer: vaultReferer,
-        cfProxy: CF_STREAM_PROXY || null,  // Route through CF Worker on production
+      url: vaultUrl(decodedUrl, {
+        origin: "https://vidlink.pro",
+        referer: "https://vidlink.pro/",
+        cfProxy: CF_STREAM_PROXY || null,  // CF Worker handles Origin header
       }),
       type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
       label: s.quality || s.server || "Auto",
