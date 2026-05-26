@@ -63,3 +63,8 @@ nb-system/*
 *har
 /new_approch/*
 *.ps1
+/newprovider/*
+/newprovider_test/*
+*.bak
+*.json
+*.js

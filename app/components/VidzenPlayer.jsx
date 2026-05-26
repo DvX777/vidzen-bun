@@ -16,13 +16,21 @@ const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b1
 const SAVE_INTERVAL = 5000;
 
 const SERVER_LABELS = {
-  "sv-c3d5": { name: "Alpha", color: "#22c55e" },
-  "sv-a1f3": { name: "Core",  color: "#3b82f6" },
-  "sv-b2e4": { name: "Fast",  color: "#8b5cf6" },
-  "sv-d4c6": { name: "Orbit", color: "#10b981" },
-  "sv-e5b7": { name: "Delta", color: "#f59e0b" },
-  "sv-f6a8": { name: "Turbo", color: "#06b6d4" },
-  "sv-g7b9": { name: "Flux",  color: "#ec4899" },
+  // Tier 1: Best (Fastest)
+  "sv-f6a8": { name: "Turbo", color: "#22c55e", badge: "⚡ Ultra" },
+  "sv-v1s3": { name: "Vortex", color: "#22c55e", badge: "⚡ Ultra" },
+  // Tier 2: High Quality
+  "sv-a1f3": { name: "Core",  color: "#a855f7", badge: "💎 Premium" },
+  "sv-b2e4": { name: "Fast",  color: "#a855f7", badge: "💎 Premium" },
+  // Tier 3: Average
+  "sv-d4c6": { name: "Orbit", color: "#3b82f6", badge: "⭐ Standard" },
+  "sv-e5b7": { name: "Delta", color: "#3b82f6", badge: "⭐ Standard" },
+  "sv-h9u4": { name: "Nova",  color: "#3b82f6", badge: "⭐ Standard" },
+  // Tier 4: Beta (Failing/Issues)
+  "sv-v2x4": { name: "Matrix", color: "#ef4444", badge: "🧪 Beta", beta: true },
+  "sv-c3d5": { name: "Alpha",  color: "#ef4444", badge: "🧪 Beta", beta: true },
+  "sv-g7b9": { name: "Flux",   color: "#ef4444", badge: "🧪 Beta", beta: true },
+  "sv-m8d1": { name: "Apollo", color: "#ef4444", badge: "🧪 Beta", beta: true },
 };
 
 // ── Vidstack-native icons ─────────────────────────────────────────────────
@@ -478,7 +486,33 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
               const info = SERVER_LABELS[server] || { name: server };
               const isFailed = failedServers.has(server);
               return {
-                label: isFailed ? `${info.name} (unavailable)` : info.name,
+                label: (
+                  <div style={{ display: "flex", flexDirection: "column", gap: "2px", width: "100%", paddingRight: "8px" }}>
+                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
+                      <span style={{ color: isFailed ? "rgba(255,255,255,0.4)" : "inherit" }}>
+                        {info.name} {isFailed && "(unavailable)"}
+                      </span>
+                      {info.badge && (
+                        <span style={{
+                          fontSize: "10px",
+                          fontWeight: 700,
+                          padding: "2px 6px",
+                          borderRadius: "4px",
+                          backgroundColor: isFailed ? "rgba(255,255,255,0.05)" : (info.color + "20"),
+                          color: isFailed ? "rgba(255,255,255,0.3)" : info.color,
+                          whiteSpace: "nowrap"
+                        }}>
+                          {info.badge}
+                        </span>
+                      )}
+                    </div>
+                    {info.beta && (
+                      <span style={{ fontSize: "10px", color: "rgba(255,255,255,0.4)", lineHeight: 1.2 }}>
+                        This provider is in BETA and can be unreliable.
+                      </span>
+                    )}
+                  </div>
+                ),
                 value: server,
               };
             })}

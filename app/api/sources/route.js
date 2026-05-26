@@ -20,6 +20,10 @@ const PROVIDER_ALIAS = {
   piexe: "sv-e5b7",
   vidlink: "sv-f6a8",
   yflix: "sv-g7b9",
+  moviesdrive: "sv-m8d1",
+  hdhub4u: "sv-h9u4",
+  vidsrc: "sv-v1s3",
+  vixsrc: "sv-v2x4",
 };
 const ALIAS_REVERSE = Object.fromEntries(Object.entries(PROVIDER_ALIAS).map(([k, v]) => [v, k]));
 function maskName(name) { return PROVIDER_ALIAS[name] || name; }
@@ -243,6 +247,48 @@ function normalizeYflix(data) {
   return { sources, subtitles };
 }
 
+function normalizeMoviesdrive(data) {
+  const payload = data?.data || data;
+  if (data?.success === false || payload?.error) return null;
+  const streams = payload?.sources || payload?.streams || (Array.isArray(payload) ? payload : []);
+  if (!streams.length) return null;
+  const sources = streams.map(s => {
+    return {
+      url: vaultUrl(s.url, {
+        origin: "https://moviesdrive.design",
+        referer: "https://moviesdrive.design/",
+        cfProxy: CF_STREAM_PROXY || null,
+      }),
+      type: "mp4",
+      label: s.quality || s.source || s.name || s.title || "Auto",
+      server: maskName("moviesdrive"),
+    };
+  });
+  return { sources, subtitles: [] };
+}
+
+function normalizeHdhub4u(data) {
+  const payload = data?.data || data;
+  if (data?.success === false || payload?.error) return null;
+  const streams = payload?.sources || payload?.streams || (Array.isArray(payload) ? payload : []);
+  if (!streams.length) return null;
+  const sources = streams
+    .filter(s => s.url && s.url.includes('.m3u8'))
+    .map(s => {
+      return {
+        url: vaultUrl(s.url, {
+          origin: "https://hubstream.art",
+          referer: "https://hubstream.art/",
+        }),
+        type: "hls",
+        label: s.quality || s.source || s.name || s.title || "Auto",
+        server: maskName("hdhub4u"),
+      };
+    });
+  if (sources.length === 0) return null;
+  return { sources, subtitles: [] };
+}
+
 // ── Provider fetch functions ───────────────────────────────────────────────
 function tryPrimeSrc(type, id, season, episode) {
   const path = type === "movie"
@@ -294,6 +340,34 @@ function tryYflix(type, id, season, episode) {
   return fetchJSON(path, 25000).then(normalizeYflix);
 }
 
+function tryMoviesdrive(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/moviesdrive/movie/${id}`
+    : `${NB_URL}/stream/moviesdrive/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 120000).then(normalizeMoviesdrive);
+}
+
+function tryHdhub4u(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/hdhub4u/movie/${id}`
+    : `${NB_URL}/stream/hdhub4u/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 120000).then(normalizeHdhub4u);
+}
+
+function tryVidsrc(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/vidsrc/movie/${id}`
+    : `${NB_URL}/stream/vidsrc/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 30000).then(normalizeStream);
+}
+
+function tryVixsrc(type, id, season, episode) {
+  const path = type === "movie"
+    ? `${NB_URL}/stream/vixsrc/movie/${id}`
+    : `${NB_URL}/stream/vixsrc/tv/${id}/${season}/${episode}`;
+  return fetchJSON(path, 30000).then(normalizeStream);
+}
+
 const PROVIDER_MAP = {
   primesrc: tryPrimeSrc,
   vidcore: tryVidcore,
@@ -302,12 +376,16 @@ const PROVIDER_MAP = {
   piexe: tryPiexe,
   vidlink: tryVidlink,
   yflix: tryYflix,
+  moviesdrive: tryMoviesdrive,
+  hdhub4u: tryHdhub4u,
+  vidsrc: tryVidsrc,
+  vixsrc: tryVixsrc,
 };
 
 // Providers excluded from the automatic race (but still available via forced server switch).
 // VidLink: storm.vodvidl.site blocks datacenter + CF Worker IPs (only residential works).
-// Including it in the race poisons the cache with 403-producing sources.
-const RACE_EXCLUDED = new Set(["yflix"]);
+// VixSrc: Cloudflare blocks VPS IPs, explicitly excluded from race.
+const RACE_EXCLUDED = new Set(["yflix", "vixsrc"]);
 
 // ── Parallel Race: fire all, return the FIRST with sources ────────────────
 async function raceProviders(type, id, season, episode) {
@@ -317,14 +395,14 @@ async function raceProviders(type, id, season, episode) {
     return fn(type, id, season, episode)
       .then(result => {
         if (result && result.sources?.length > 0) {
-          console.log(`[sources] ✓ ${name} — ${result.sources.length} sources`);
+          console.log(`[sources] ✓ ${maskName(name)} — ${result.sources.length} sources`);
           return { provider: maskName(name), ...result };
         }
-        console.log(`[sources] ✗ ${name} — no sources`);
+        console.log(`[sources] ✗ ${maskName(name)} — no sources`);
         return null;
       })
       .catch(err => {
-        console.log(`[sources] ✗ ${name} — ${err.message}`);
+        console.log(`[sources] ✗ ${maskName(name)} — ${err.message}`);
         return null;
       });
   });
@@ -409,7 +487,7 @@ export async function GET(request) {
     let result = null;
     let lastError = null;
     try {
-      console.log(`[sources] Forced server: ${forcedServer} for ${type}/${id}`);
+      console.log(`[sources] Forced server: ${maskName(forcedServer)} for ${type}/${id}`);
       result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
     } catch (err) {
       lastError = err.message;
@@ -419,7 +497,7 @@ export async function GET(request) {
     // Retry once after 2s if first attempt returned nothing
     if (!result?.sources?.length && !lastError?.includes("aborted")) {
       try {
-        console.log(`[sources] Retrying ${forcedServer} after 2s...`);
+        console.log(`[sources] Retrying ${maskName(forcedServer)} after 2s...`);
         await new Promise(r => setTimeout(r, 2000));
         result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
       } catch (err) {
@@ -447,7 +525,7 @@ export async function GET(request) {
       if (firstRefreshedUrl?.startsWith("/api/stream/")) {
         const testId = firstRefreshedUrl.split("/").pop();
         if (resolveUrl(testId)) {
-          console.log(`[sources] ${forcedServer} failed but found live stale cache — using fallback`);
+          console.log(`[sources] ${maskName(forcedServer)} failed but found live stale cache — using fallback`);
           return Response.json({
             ...refreshed,
             provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
