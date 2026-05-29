@@ -303,27 +303,6 @@ function normalizeHdhub4u(data) {
   return { sources, subtitles: [] };
 }
 
-function normalizeVideasy(data) {
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  if (!payload?.streams?.length) return null;
-  const sources = payload.streams.map(s => {
-    return {
-      url: vaultUrl(s.url, {
-        origin: s.referer || "https://videasy.net",
-        referer: s.referer || "https://videasy.net/",
-      }),
-      _probeUrl: s.url,  // raw URL for SFB
-      _probeOrigin: s.referer || "https://videasy.net",
-      _probeReferer: s.referer || "https://videasy.net/",
-      type: s.stream_type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-      label: s.server || s.quality || "Auto",
-      server: maskName("videasy"),
-    };
-  });
-  return { sources, subtitles: [] };
-}
-
 // ── Provider fetch functions ───────────────────────────────────────────────
 function tryPrimeSrc(type, id, season, episode) {
   const path = type === "movie"
@@ -403,18 +382,6 @@ function tryVixsrc(type, id, season, episode) {
   return fetchJSON(path, 8000).then(normalizeStream);
 }
 
-import { scrapeVideasy } from "@/lib/videasy";
-
-async function tryVideasy(type, id, season, episode) {
-  try {
-    const data = await scrapeVideasy(type, id, season, episode);
-    return normalizeVideasy(data);
-  } catch (err) {
-    console.error("[tryVideasy] Error:", err.message || err);
-    return null;
-  }
-}
-
 const PROVIDER_MAP = {
   primesrc: tryPrimeSrc,
   vidcore: tryVidcore,
@@ -427,7 +394,6 @@ const PROVIDER_MAP = {
   hdhub4u: tryHdhub4u,
   vidsrc: tryVidsrc,
   vixsrc: tryVixsrc,
-  videasy: tryVideasy,
 };
 
 // Providers excluded from the automatic race (but still available via forced server switch).
