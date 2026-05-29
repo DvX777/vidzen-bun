@@ -11,26 +11,31 @@ import {
 import "@vidstack/react/player/styles/default/theme.css";
 import "@vidstack/react/player/styles/default/layouts/video.css";
 import { saveProgress, getProgress } from "../lib/watchProgress";
+import { ErrorClass, classifyHttpError, classifyNetworkError, isFatal } from "../lib/sfb";
 
 const TMDB_KEY = process.env.NEXT_PUBLIC_TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
 const SAVE_INTERVAL = 5000;
 
 const SERVER_LABELS = {
-  // Tier 1: Best (Fastest)
-  "sv-f6a8": { name: "Turbo", color: "#22c55e", badge: "⚡ Ultra" },
-  "sv-v1s3": { name: "Vortex", color: "#22c55e", badge: "⚡ Ultra" },
-  // Tier 2: High Quality
-  "sv-a1f3": { name: "Core",  color: "#a855f7", badge: "💎 Premium" },
-  "sv-b2e4": { name: "Fast",  color: "#a855f7", badge: "💎 Premium" },
-  // Tier 3: Average
-  "sv-d4c6": { name: "Orbit", color: "#3b82f6", badge: "⭐ Standard" },
-  "sv-e5b7": { name: "Delta", color: "#3b82f6", badge: "⭐ Standard" },
-  "sv-h9u4": { name: "Nova",  color: "#3b82f6", badge: "⭐ Standard" },
-  // Tier 4: Beta (Failing/Issues)
-  "sv-v2x4": { name: "Matrix", color: "#ef4444", badge: "🧪 Beta", beta: true },
-  "sv-c3d5": { name: "Alpha",  color: "#ef4444", badge: "🧪 Beta", beta: true },
-  "sv-g7b9": { name: "Flux",   color: "#ef4444", badge: "🧪 Beta", beta: true },
-  "sv-m8d1": { name: "Apollo", color: "#ef4444", badge: "🧪 Beta", beta: true },
+  "sv-f6a8": { name: "Turbo", tier: "ultra" },
+  "sv-v1s3": { name: "Vortex", tier: "ultra" },
+  "sv-a1f3": { name: "Core", tier: "premium" },
+  "sv-b2e4": { name: "Fast", tier: "premium" },
+  "sv-d4c6": { name: "Orbit", tier: "standard" },
+  "sv-e5b7": { name: "Delta", tier: "standard" },
+  "sv-h9u4": { name: "Nova", tier: "standard" },
+  "sv-v2x4": { name: "Matrix", tier: "beta" },
+  "sv-c3d5": { name: "Alpha", tier: "beta" },
+  "sv-g7b9": { name: "Flux", tier: "beta" },
+  "sv-m8d1": { name: "Apollo", tier: "beta" },
+};
+
+const TIER_ORDER = { ultra: 0, premium: 1, standard: 2, beta: 3 };
+const TIER_META = {
+  ultra: { label: "ULTRA", dot: "#4ade80" },
+  premium: { label: "PREMIUM", dot: "#c084fc" },
+  standard: { label: "STANDARD", dot: "#60a5fa" },
+  beta: { label: "BETA", dot: "#f87171" },
 };
 
 // ── Vidstack-native icons ─────────────────────────────────────────────────
@@ -39,12 +44,12 @@ const SERVER_LABELS = {
 function ProviderIcon(props) {
   return (
     <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {...props}>
-      <path d="M7 10h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
-      <path d="M7 16h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
-      <path d="M7 22h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round"/>
-      <circle cx="12" cy="10" r="2.5" fill="currentColor"/>
-      <circle cx="22" cy="16" r="2.5" fill="currentColor"/>
-      <circle cx="15" cy="22" r="2.5" fill="currentColor"/>
+      <path d="M7 10h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+      <path d="M7 16h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+      <path d="M7 22h18" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" />
+      <circle cx="12" cy="10" r="2.5" fill="currentColor" />
+      <circle cx="22" cy="16" r="2.5" fill="currentColor" />
+      <circle cx="15" cy="22" r="2.5" fill="currentColor" />
     </svg>
   );
 }
@@ -54,11 +59,11 @@ function ProviderIcon(props) {
 function QualityMenuIcon(props) {
   return (
     <svg viewBox="0 0 32 32" fill="none" xmlns="http://www.w3.org/2000/svg" aria-hidden="true" {...props}>
-      <rect x="4" y="6" width="24" height="16" rx="2" fill="currentColor"/>
-      <path d="M11.5 18V12l3.5 3-3.5 3z" fill="var(--media-brand, #000)" opacity=".8"/>
+      <rect x="4" y="6" width="24" height="16" rx="2" fill="currentColor" />
+      <path d="M11.5 18V12l3.5 3-3.5 3z" fill="var(--media-brand, #000)" opacity=".8" />
       <text x="17" y="17" fontSize="7" fontWeight="700" fontFamily="sans-serif" fill="var(--media-brand, #000)" opacity=".8">HD</text>
-      <path d="M12 25h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
-      <path d="M16 22v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round"/>
+      <path d="M12 25h8" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
+      <path d="M16 22v3" stroke="currentColor" strokeWidth="2" strokeLinecap="round" />
     </svg>
   );
 }
@@ -98,6 +103,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const [meta, setMeta] = useState({ title: "", poster: "", backdrop: "" });
   const [devToolsBlocked, setDevToolsBlocked] = useState(false);
   const [toast, setToast] = useState(null);
+  const [backgroundPolling, setBackgroundPolling] = useState(false);
 
   const progressRef = useRef({ time: 0, duration: 0 });
   const saveTimerRef = useRef(null);
@@ -227,7 +233,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       const blocked = e.detail?.blocked ?? false;
       setDevToolsBlocked(blocked);
       if (blocked) {
-        try { playerRef.current?.pause(); } catch {}
+        try { playerRef.current?.pause(); } catch { }
       }
     };
     window.addEventListener('vz:devtools', handler);
@@ -279,10 +285,27 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       if (!data.sources?.length) {
         if (server && sourcesRef.current.length > 0) {
           const serverName = SERVER_LABELS[server]?.name || server;
-          setFailedServers(prev => new Set([...prev, server]));
-          const msg = `${serverName} is unavailable`;
-          showToast(msg, 'error');
-          setSwitching(null);
+          const newFailed = new Set(failedServers);
+          newFailed.add(server);
+          setFailedServers(newFailed);
+
+          showToast(`${serverName} is unavailable, finding alternative...`, 'error');
+
+          // Smart automatic fallback to best tier
+          const sorted = [...(data.servers || availableServers)].sort((a, b) => {
+            const ta = SERVER_LABELS[a]?.tier || "standard";
+            const tb = SERVER_LABELS[b]?.tier || "standard";
+            return (TIER_ORDER[ta] ?? 99) - (TIER_ORDER[tb] ?? 99);
+          });
+
+          // First try to stay on current if it's still good, otherwise pick best
+          const fallbackServer = !newFailed.has(currentServer) ? currentServer : sorted.find(s => !newFailed.has(s));
+
+          if (fallbackServer && fallbackServer !== server) {
+            setTimeout(() => fetchSources(fallbackServer), 100);
+          } else {
+            setSwitching(null);
+          }
           return;
         }
         throw new Error(data.error || "No sources found");
@@ -315,6 +338,11 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         setSubtitles(data.subtitles);
       }
       setSwitching(null);
+      if (data.provider === "vidcore" || data.provider === "vidfast") {
+        setBackgroundPolling(true);
+      } else {
+        setBackgroundPolling(false);
+      }
     } catch (err) {
       console.error("[VidzenPlayer] Source fetch failed:", err.message);
       if (!sourcesRef.current.length) {
@@ -323,8 +351,57 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         showToast(err.message, 'error');
       }
       setSwitching(null);
+      setBackgroundPolling(false);
     }
   }, [type, id, season, episode, showToast]);
+
+  // ── Background Polling for Vidcore/Vidfast ──────────────────────────────
+  useEffect(() => {
+    if (!currentServer || (currentServer !== "vidcore" && currentServer !== "vidfast")) {
+      setBackgroundPolling(false);
+      return;
+    }
+
+    if (!backgroundPolling) return;
+
+    let pollCount = 0;
+    const MAX_POLLS = 6; // 6 polls * 2.5s = 15 seconds
+
+    const pollInterval = setInterval(async () => {
+      pollCount++;
+      if (pollCount >= MAX_POLLS) {
+        setBackgroundPolling(false);
+        clearInterval(pollInterval);
+        return;
+      }
+
+      try {
+        const params = new URLSearchParams({ type, id });
+        if (season) params.set("season", season);
+        if (episode) params.set("episode", episode);
+        params.set("server", currentServer);
+
+        const res = await fetch(`/api/sources?${params}`);
+        if (res.ok) {
+          const data = await res.json();
+          if (data.sources && data.sources.length > sourcesRef.current.length) {
+            console.log(`[VidzenPlayer] Background sync: found ${data.sources.length} sources (was ${sourcesRef.current.length})`);
+            setSources(data.sources);
+            sourcesRef.current = data.sources;
+
+            // Re-eval subtitles if any new came in
+            if (data.subtitles && data.subtitles.length > 0 && (!subtitles || subtitles.length === 0)) {
+              setSubtitles(data.subtitles);
+            }
+          }
+        }
+      } catch (err) {
+        console.warn("[VidzenPlayer] Background poll error:", err.message);
+      }
+    }, 2500);
+
+    return () => clearInterval(pollInterval);
+  }, [backgroundPolling, currentServer, type, id, season, episode, subtitles]);
 
   // ── Fetch subtitles — FIX: was `tmdb_id`, API expects `id` ─────────────
   const fetchSubtitles = useCallback(async () => {
@@ -409,30 +486,78 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const errorCountRef = useRef(0);
   const lastErrorTimeRef = useRef(0);
 
-  const handleError = useCallback(() => {
+  const handleError = useCallback((err) => {
     if (!currentServer) return;
 
-    // Debounce: ignore rapid-fire errors (HLS fires multiple for same failure)
-    const now = Date.now();
-    if (now - lastErrorTimeRef.current < 2000) return;
-    lastErrorTimeRef.current = now;
+    // ── SFBS: Smart Error Classification ──────────────────────────────────
+    let errClass = ErrorClass.OK;
+    let isInstantFatal = false;
+    let statusCode = 0;
 
-    errorCountRef.current++;
-    // Stop auto-switching after 3 consecutive errors (prevents infinite loop)
-    if (errorCountRef.current > 3) {
-      console.warn("[VidzenPlayer] Too many errors, stopping auto-switch");
-      setError("Unable to load stream. Please try a different server.");
-      return;
+    // Try to extract HLS error details from Vidstack's error event
+    // err might be a native MediaError, or a custom Vidstack/HLS error object
+    const detail = err?.detail || err;
+    if (detail) {
+      // HLS.js often includes the HTTP response code for network errors
+      if (detail.response && detail.response.code) {
+        statusCode = detail.response.code;
+        errClass = classifyHttpError(statusCode);
+      } else if (detail.status) {
+        statusCode = detail.status;
+        errClass = classifyHttpError(statusCode);
+      } else if (detail.message || err.message) {
+        errClass = classifyNetworkError(detail.message || err.message);
+      }
     }
 
-    setFailedServers(prev => new Set([...prev, currentServer]));
-    const remaining = availableServers.filter(
-      s => s !== currentServer && !failedServers.has(s)
-    );
-    if (remaining.length > 0) {
-      fetchSources(remaining[0]);
-    } else {
-      setError("All servers are currently unavailable. Please try again later.");
+    if (isFatal(errClass)) {
+      console.error(`[VidzenPlayer] SFBS FATAL ERROR (${errClass}${statusCode ? ` HTTP ${statusCode}` : ''}) — Switching instantly.`);
+      isInstantFatal = true;
+    }
+
+    // ── Fallback Logic ──────────────────────────────────────────────────
+    const now = Date.now();
+    
+    // Only debounce if NOT instantly fatal
+    if (!isInstantFatal) {
+      if (now - lastErrorTimeRef.current < 500) return;
+      lastErrorTimeRef.current = now;
+      errorCountRef.current++;
+    }
+
+    const tier = SERVER_LABELS[currentServer]?.tier || "standard";
+    const maxErrors = tier === "beta" ? 1 : 2;
+
+    // If it's a fatal error, or we've hit the error threshold
+    if (isInstantFatal || errorCountRef.current >= maxErrors) {
+      // Stop auto-switching if we've completely exhausted retries 
+      // (give 1 extra life if it was instant fatal, otherwise stop at maxErrors + 2)
+      if (errorCountRef.current > maxErrors + 2) {
+        console.warn("[VidzenPlayer] Too many errors, stopping auto-switch");
+        setError("Unable to load stream. Please try a different server.");
+        return;
+      }
+
+      const newFailed = new Set(failedServers);
+      newFailed.add(currentServer);
+      setFailedServers(newFailed);
+
+      // Smart failover: pick best tier available, prioritizing Ultra/Premium
+      const sorted = [...availableServers].sort((a, b) => {
+        const ta = SERVER_LABELS[a]?.tier || "standard";
+        const tb = SERVER_LABELS[b]?.tier || "standard";
+        return (TIER_ORDER[ta] ?? 99) - (TIER_ORDER[tb] ?? 99);
+      });
+
+      const nextServer = sorted.find(s => !newFailed.has(s));
+
+      if (nextServer) {
+        console.log(`[VidzenPlayer] Failover: ${currentServer} → ${nextServer} (SFBS: ${errClass})`);
+        errorCountRef.current = 0;  // Reset for next server
+        fetchSources(nextServer);
+      } else {
+        setError("All servers are currently unavailable. Please try again later.");
+      }
     }
   }, [currentServer, availableServers, failedServers, fetchSources]);
 
@@ -447,7 +572,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     playerRef.current.play().catch((err) => {
       if (err.name === "NotAllowedError") {
         playerRef.current.muted = true;
-        playerRef.current.play().catch(() => {});
+        playerRef.current.play().catch(() => { });
       }
     });
   }, []);
@@ -472,58 +597,87 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
 
   // Provider popup — SEPARATE button in the control bar (via airPlayButton slot)
   // Uses Menu.Root + Menu.Button for a standalone popup, NOT inside settings
+  // Fully custom menu — no DefaultMenuRadioGroup — for pixel-perfect control
+  const sortedServers = useMemo(() => {
+    return [...availableServers].sort((a, b) => {
+      const ta = SERVER_LABELS[a]?.tier || "standard";
+      const tb = SERVER_LABELS[b]?.tier || "standard";
+      return (TIER_ORDER[ta] ?? 99) - (TIER_ORDER[tb] ?? 99);
+    });
+  }, [availableServers]);
+
   const ProviderButton = useMemo(() => {
-    if (availableServers.length === 0) return null;
+    if (sortedServers.length === 0) return null;
+
+    let lastTier = null;
+
     return (
       <Menu.Root className="vds-provider-menu vds-menu">
         <Menu.Button className="vds-button" aria-label="Switch Provider">
           <ProviderIcon className="vds-icon" style={{ width: 26, height: 26 }} />
         </Menu.Button>
-        <Menu.Content className="vds-menu-items" placement="top end">
-          <DefaultMenuRadioGroup
-            value={currentServer || ""}
-            options={availableServers.map(server => {
-              const info = SERVER_LABELS[server] || { name: server };
-              const isFailed = failedServers.has(server);
-              return {
-                label: (
-                  <div style={{ display: "flex", flexDirection: "column", gap: "2px", width: "100%", paddingRight: "8px" }}>
-                    <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", gap: "12px" }}>
-                      <span style={{ color: isFailed ? "rgba(255,255,255,0.4)" : "inherit" }}>
-                        {info.name} {isFailed && "(unavailable)"}
-                      </span>
-                      {info.badge && (
-                        <span style={{
-                          fontSize: "10px",
-                          fontWeight: 700,
-                          padding: "2px 6px",
-                          borderRadius: "4px",
-                          backgroundColor: isFailed ? "rgba(255,255,255,0.05)" : (info.color + "20"),
-                          color: isFailed ? "rgba(255,255,255,0.3)" : info.color,
-                          whiteSpace: "nowrap"
-                        }}>
-                          {info.badge}
-                        </span>
-                      )}
-                    </div>
-                    {info.beta && (
-                      <span style={{ fontSize: "10px", color: "rgba(255,255,255,0.4)", lineHeight: 1.2 }}>
-                        This provider is in BETA and can be unreliable.
-                      </span>
-                    )}
+        <Menu.Content className="vds-menu-items vz-srv-menu" placement="top end">
+          {sortedServers.map((server) => {
+            const info = SERVER_LABELS[server] || { name: server, tier: "standard" };
+            const tier = info.tier || "standard";
+            const meta = TIER_META[tier];
+            const isActive = server === currentServer;
+            const isFailed = failedServers.has(server);
+            const isBeta = tier === "beta";
+
+            // Insert a thin divider when the tier group changes
+            const showDivider = lastTier !== null && lastTier !== tier;
+            lastTier = tier;
+
+            return (
+              <div key={server} style={{ width: "100%" }}>
+                {showDivider && <div className="vz-srv-divider" />}
+                {/* Beta notice — only on the FIRST beta item */}
+                {isBeta && showDivider && (
+                  <div className="vz-srv-beta-note">
+                    <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round"><circle cx="12" cy="12" r="10" /><line x1="12" y1="8" x2="12" y2="12" /><line x1="12" y1="16" x2="12.01" y2="16" /></svg>
+                    Experimental — may be unreliable
                   </div>
-                ),
-                value: server,
-              };
-            })}
-            onChange={(newVal) => {
-              if (!failedServers.has(newVal)) switchServer(newVal);
-            }}
-          />
+                )}
+                <button
+                  className={`vz-srv-item${isActive ? " vz-srv-active" : ""}${isFailed ? " vz-srv-failed" : ""}${isBeta ? " vz-srv-beta" : ""}`}
+                  onClick={() => { if (!isFailed) switchServer(server); }}
+                  disabled={isFailed}
+                >
+                  {/* Name */}
+                  <span className="vz-srv-name">{info.name}</span>
+                  {/* Badge — each tier has its own SVG icon + styled label */}
+                  {tier === "ultra" && (
+                    <span className="vz-srv-badge vz-srv-badge-ultra">
+                      <svg width="10" height="10" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><polygon points="13 2 3 14 12 14 11 22 21 10 12 10 13 2" /></svg>
+                      ULTRA
+                    </span>
+                  )}
+                  {tier === "premium" && (
+                    <span className="vz-srv-badge vz-srv-badge-premium">
+                      <svg width="9" height="9" viewBox="0 0 24 24" fill="currentColor"><path d="M12 2L15.09 8.26L22 9.27L17 14.14L18.18 21.02L12 17.77L5.82 21.02L7 14.14L2 9.27L8.91 8.26L12 2Z" /></svg>
+                      PREMIUM
+                    </span>
+                  )}
+                  {tier === "standard" && (
+                    <span className="vz-srv-badge vz-srv-badge-standard">
+                      <svg width="9" height="9" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.5" strokeLinecap="round" strokeLinejoin="round"><path d="M12 22s8-4 8-10V5l-8-3-8 3v7c0 6 8 10 8 10z" /></svg>
+                      STANDARD
+                    </span>
+                  )}
+                  {tier === "beta" && (
+                    <span className="vz-srv-badge vz-srv-badge-beta">
+                      BETA
+                    </span>
+                  )}
+                </button>
+              </div>
+            );
+          })}
         </Menu.Content>
       </Menu.Root>
     );
-  }, [availableServers, currentServer, failedServers, switchServer]);
+  }, [sortedServers, currentServer, failedServers, switchServer]);
 
   // Quality submenu — ALWAYS shows, even with 1 option like "Auto"
   // Sorted: 360p → 480p → 720p → 1080p
@@ -572,6 +726,150 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
 
   return (
     <div style={styles.wrapper}>
+      <style>{`
+        /* ── Server menu container ─────────────────────────────── */
+        .vz-srv-menu {
+          min-width: 220px !important;
+          padding: 6px !important;
+        }
+
+        /* ── Divider between tier groups ───────────────────────── */
+        .vz-srv-divider {
+          height: 1px;
+          margin: 5px 12px;
+          background: linear-gradient(90deg, transparent, rgba(255,255,255,0.07), transparent);
+        }
+
+        /* ── Individual server row ─────────────────────────────── */
+        .vz-srv-item {
+          display: flex;
+          align-items: center;
+          justify-content: flex-start !important;
+          gap: 12px;
+          width: 100%;
+          padding: 9px 12px;
+          border: none;
+          border-radius: 6px;
+          background: transparent;
+          color: rgba(255,255,255,0.88);
+          font: 600 13px/1 'Plus Jakarta Sans', system-ui, sans-serif;
+          cursor: pointer;
+          transition: background 0.15s ease, border-color 0.15s ease;
+          text-align: left;
+          box-sizing: border-box;
+          border-left: 2px solid transparent;
+        }
+        .vz-srv-item:hover:not(:disabled) {
+          background: rgba(255,255,255,0.06);
+        }
+        .vz-srv-item.vz-srv-active {
+          background: rgba(255,255,255,0.08);
+          border-left-color: var(--vz-active-color, #60a5fa);
+        }
+        .vz-srv-item.vz-srv-failed {
+          opacity: 0.3;
+          cursor: not-allowed;
+        }
+        .vz-srv-item.vz-srv-beta {
+          color: rgba(255,255,255,0.5);
+        }
+
+        /* ── Server name ──────────────────────────────────────── */
+        .vz-srv-name {
+          letter-spacing: 0.01em;
+        }
+
+        /* ── Badge base ────────────────────────────────────────── */
+        .vz-srv-badge {
+          display: inline-flex;
+          align-items: center;
+          gap: 4px;
+          font-size: 9px;
+          font-weight: 700;
+          letter-spacing: 0.6px;
+          padding: 3px 7px;
+          border-radius: 4px;
+          flex-shrink: 0;
+          line-height: 1;
+        }
+
+        /* ── ULTRA ── electric green glow, lightning energy ──── */
+        .vz-srv-badge-ultra {
+          color: #4ade80;
+          background: linear-gradient(135deg, rgba(34,197,94,0.18) 0%, rgba(16,185,129,0.12) 100%);
+          border: 1px solid rgba(74, 222, 128, 0.25);
+          box-shadow: 0 0 10px rgba(74, 222, 128, 0.12),
+                      0 0 2px rgba(74, 222, 128, 0.3);
+          animation: vz-ultra-glow 2.5s ease-in-out infinite;
+        }
+        .vz-srv-badge-ultra svg {
+          filter: drop-shadow(0 0 3px rgba(74, 222, 128, 0.6));
+        }
+        @keyframes vz-ultra-glow {
+          0%, 100% { box-shadow: 0 0 10px rgba(74,222,128,0.12), 0 0 2px rgba(74,222,128,0.3); }
+          50%      { box-shadow: 0 0 14px rgba(74,222,128,0.25), 0 0 4px rgba(74,222,128,0.5); }
+        }
+
+        /* ── PREMIUM ── purple-gold luxury with shimmer ──────── */
+        .vz-srv-badge-premium {
+          color: #d8b4fe;
+          background: linear-gradient(135deg, rgba(147,51,234,0.2) 0%, rgba(168,85,247,0.12) 50%, rgba(217,119,6,0.1) 100%);
+          border: 1px solid rgba(192, 132, 252, 0.2);
+          position: relative;
+          overflow: hidden;
+        }
+        .vz-srv-badge-premium svg {
+          filter: drop-shadow(0 0 2px rgba(192, 132, 252, 0.5));
+        }
+        .vz-srv-badge-premium::after {
+          content: '';
+          position: absolute;
+          top: -50%; left: -100%; width: 60%; height: 200%;
+          background: linear-gradient(105deg, transparent, rgba(255,255,255,0.12), transparent);
+          animation: vz-premium-shine 3.5s ease-in-out infinite;
+        }
+        @keyframes vz-premium-shine {
+          0%   { transform: translateX(0) rotate(25deg); }
+          30%  { transform: translateX(350%) rotate(25deg); }
+          100% { transform: translateX(350%) rotate(25deg); }
+        }
+
+        /* ── STANDARD ── clean blue shield, solid & reliable ──── */
+        .vz-srv-badge-standard {
+          color: #60a5fa;
+          background: rgba(59, 130, 246, 0.1);
+          border: 1px solid rgba(96, 165, 250, 0.18);
+        }
+        .vz-srv-badge-standard svg {
+          opacity: 0.8;
+        }
+
+        /* ── BETA ── hollow, experimental, understated ────────── */
+        .vz-srv-badge-beta {
+          color: rgba(251, 146, 60, 0.7);
+          background: transparent;
+          border: 1px dashed rgba(251, 146, 60, 0.25);
+          font-weight: 600;
+          font-size: 8px;
+          letter-spacing: 1px;
+          padding: 2px 6px;
+        }
+
+        /* ── Beta notice row ───────────────────────────────────── */
+        .vz-srv-beta-note {
+          display: flex;
+          align-items: center;
+          gap: 5px;
+          font-size: 10px;
+          color: rgba(255,255,255,0.25);
+          padding: 4px 12px 2px 28px;
+          font-style: italic;
+        }
+        .vz-srv-beta-note svg {
+          flex-shrink: 0;
+          opacity: 0.5;
+        }
+      `}</style>
       <MediaPlayer
         key={currentServer || "init"}
         ref={playerRef}
@@ -589,6 +887,25 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         onTimeUpdate={handleTimeUpdate}
         onPause={saveNow}
         onError={handleError}
+        onProviderChange={(provider) => {
+          if (provider?.type === "hls") {
+            provider.onInstance((hls) => {
+              hls.on("hlsError", (event, data) => {
+                const code = data.response?.code;
+                if (code) {
+                  const errClass = classifyHttpError(code);
+                  if (isFatal(errClass)) {
+                    console.error(`[VidzenPlayer] SFBS Intercept: HLS.js hit HTTP ${code} (${errClass}). Destroying instance and instantly failing over.`);
+                    setTimeout(() => {
+                      if (hls) hls.destroy(); // Prevent cascading errors safely
+                    }, 0);
+                    handleError({ detail: { response: { code } } }); // Trigger fallback
+                  }
+                }
+              });
+            });
+          }
+        }}
         style={{ width: "100%", height: "100%" }}
       >
         <MediaProvider>
@@ -617,8 +934,8 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
           background: "rgba(3,7,18,0.97)", backdropFilter: "blur(20px)",
         }}>
           <svg width="48" height="48" viewBox="0 0 24 24" fill="none" stroke="#f43f5e" strokeWidth="1.5" strokeLinecap="round" strokeLinejoin="round" style={{ marginBottom: 16, opacity: 0.8 }}>
-            <rect x="3" y="11" width="18" height="11" rx="2" ry="2"/>
-            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+            <rect x="3" y="11" width="18" height="11" rx="2" ry="2" />
+            <path d="M7 11V7a5 5 0 0 1 10 0v4" />
           </svg>
           <h3 style={{ fontFamily: "'Plus Jakarta Sans', sans-serif", fontSize: 18, fontWeight: 700, color: "#fff", marginBottom: 8, letterSpacing: "0.02em" }}>
             Streaming Blocked

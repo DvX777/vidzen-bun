@@ -34,14 +34,15 @@ function ensureCleanup() {
  * Store a real URL behind an opaque ID.
  * @returns {string} opaque hex ID (8 chars)
  */
-export function storeUrl(url, { origin = null, referer = null, cfProxy = null } = {}) {
+export function storeUrl(url, { origin = null, referer = null, cfProxy = null, redirect = false } = {}) {
   ensureCleanup();
   const id = crypto.randomBytes(4).toString("hex"); // 8-char hex
   store.set(id, {
     url,
     origin,
     referer,
-    cfProxy,    // CF Worker URL for datacenter-blocked CDNs (e.g. VidLink)
+    cfProxy,    // CF Worker URL for datacenter-blocked CDNs
+    redirect,   // true = 302 redirect to CDN (browser fetches directly)
     expiresAt: Date.now() + VAULT_TTL_MS,
   });
   return id;
@@ -60,7 +61,7 @@ export function resolveUrl(id) {
   }
   // Touch-on-read: extend TTL while stream is actively being used
   entry.expiresAt = Date.now() + VAULT_TTL_MS;
-  return { url: entry.url, origin: entry.origin, referer: entry.referer, cfProxy: entry.cfProxy };
+  return { url: entry.url, origin: entry.origin, referer: entry.referer, cfProxy: entry.cfProxy, redirect: entry.redirect };
 }
 
 /**

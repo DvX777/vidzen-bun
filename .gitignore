@@ -68,3 +68,5 @@ nb-system/*
 *.bak
 *.json
 *.js
+*.zip
+/test_extract/*

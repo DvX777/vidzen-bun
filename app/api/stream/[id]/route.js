@@ -7,6 +7,12 @@ export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
 import { resolveUrl, vaultUrl } from "@/lib/streamVault";
+import { classifyHttpError, classifyNetworkError, ErrorClass, isFatal } from "@/lib/sfb";
+import { execFile } from "child_process";
+import { promisify } from "util";
+import path from "path";
+
+const execFileAsync = promisify(execFile);
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
 
@@ -109,7 +115,20 @@ export async function GET(request, { params }) {
     });
   }
 
-  const { url, origin, referer, cfProxy } = entry;
+  const { url, origin, referer, cfProxy, redirect } = entry;
+
+  // ── Direct redirect: browser fetches CDN directly (for CORS-enabled CDNs) ──
+  if (redirect) {
+    console.log(`[Stream] Redirect → ${url.substring(0, 80)}...`);
+    return new Response(null, {
+      status: 302,
+      headers: {
+        "Location": url,
+        "Access-Control-Allow-Origin": "*",
+        "Cache-Control": "no-store",
+      },
+    });
+  }
 
   // ── Route through CF Worker if cfProxy is set (datacenter-blocked CDNs) ──
   if (cfProxy) {
@@ -140,17 +159,84 @@ export async function GET(request, { params }) {
 
   try {
     console.log(`[Stream] Fetching: ${url.substring(0, 120)}...`);
-    const upstreamRes = await fetch(url, {
+    let upstreamRes = await fetch(url, {
       headers: upstreamHeaders,
       redirect: "follow",
     });
 
-    if (!upstreamRes.ok && upstreamRes.status !== 206) {
-      console.error(`[Stream] Upstream ${upstreamRes.status} for ${id}: ${url.substring(0, 100)}`);
-      return new Response(`Upstream error: ${upstreamRes.status}`, { status: 502 });
+    // ── Fallback for Cloudflare TLS fingerprinting blocks ────────────────
+    if (upstreamRes.status === 403 && (url.includes("midwesteagle.com") || url.includes(".m3u8"))) {
+      console.warn(`[Stream] Node fetch blocked by CF (403). Falling back to python curl_cffi for ${url.substring(0, 80)}`);
+      try {
+        const scriptPath = path.join(process.cwd(), "app", "lib", "cf_fetch.py");
+        const { stdout } = await execFileAsync("python", [scriptPath, url, referer || "", origin || ""]);
+        const cfResult = JSON.parse(stdout);
+        
+        if (cfResult.error) {
+          console.error("[Stream] cf_fetch.py error:", cfResult.error);
+        } else if (cfResult.status === 200) {
+          const rewritten = await rewriteM3U8(cfResult.text, url, origin, referer, cfProxy);
+          return new Response(rewritten, {
+            status: 200,
+            headers: {
+              "Content-Type": "application/vnd.apple.mpegurl",
+              "Access-Control-Allow-Origin": "*",
+              "Cache-Control": "no-store",
+            },
+          });
+        }
+      } catch (cfErr) {
+        console.error("[Stream] Python fallback execution failed:", cfErr.message);
+      }
     }
 
-    const contentType = upstreamRes.headers.get("content-type") || "";
+    let errClass = ErrorClass.OK;
+    if (!upstreamRes.ok && upstreamRes.status !== 206) {
+      errClass = classifyHttpError(upstreamRes.status);
+      
+      // ── SFBS: Retry once if recoverable (e.g., 502/503/timeout) ────────
+      if (!isFatal(errClass)) {
+        console.warn(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}, retrying once...`);
+        await new Promise(r => setTimeout(r, 800));
+        upstreamRes = await fetch(url, {
+          headers: upstreamHeaders,
+          redirect: "follow",
+        });
+        if (!upstreamRes.ok && upstreamRes.status !== 206) {
+          errClass = classifyHttpError(upstreamRes.status);
+        } else {
+          errClass = ErrorClass.OK;
+        }
+      }
+
+      // If still failing, return fatal error to player
+      if (!upstreamRes.ok && upstreamRes.status !== 206) {
+        console.error(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}: ${url.substring(0, 100)}`);
+        return new Response(JSON.stringify({ error: "upstream_error", status: upstreamRes.status, class: errClass }), {
+          status: 502,
+          headers: {
+            "Content-Type": "application/json",
+            "Access-Control-Allow-Origin": "*",
+            "X-SFBS-Error-Class": errClass, // Signal SFBS class to player
+          },
+        });
+      }
+    }
+
+    const contentType = (upstreamRes.headers.get("content-type") || "").toLowerCase();
+
+    // ── SFBS: Block HTML responses (usually CDN errors/blocks) ──────────
+    if (contentType.includes("text/html") || url.endsWith(".html")) {
+      console.error(`[Stream] Upstream returned HTML instead of media for ${id}: ${url.substring(0, 100)}`);
+      return new Response(JSON.stringify({ error: "invalid_content_type", class: ErrorClass.FATAL_INVALID }), {
+        status: 502,
+        headers: {
+          "Content-Type": "application/json",
+          "Access-Control-Allow-Origin": "*",
+          "X-SFBS-Error-Class": ErrorClass.FATAL_INVALID,
+        },
+      });
+    }
 
     // ── M3U8: Rewrite all internal URLs into new vault IDs ──────────
     if (
@@ -185,7 +271,15 @@ export async function GET(request, { params }) {
       headers: responseHeaders,
     });
   } catch (err) {
-    console.error(`[Stream] Proxy error for ${id}:`, err.message);
-    return new Response("Stream proxy error", { status: 502 });
+    const errClass = classifyNetworkError(err.message);
+    console.error(`[Stream] Proxy error for ${id} (${errClass}):`, err.message);
+    return new Response(JSON.stringify({ error: err.message, class: errClass }), {
+      status: 502,
+      headers: {
+        "Content-Type": "application/json",
+        "Access-Control-Allow-Origin": "*",
+        "X-SFBS-Error-Class": errClass,
+      },
+    });
   }
 }

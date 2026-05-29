@@ -6,6 +6,8 @@ export const runtime = "nodejs";
 
 import { vaultUrl, resolveUrl } from "@/lib/streamVault";
 import { cacheGet, cacheSet, sourceKey, DEFAULT_TTL, DEMO_TTL, NOT_FOUND_TTL } from "@/lib/redisCache";
+import { isBlocked } from "@/lib/blocklist";
+import { validateSources } from "@/lib/sfb";
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
 const CF_STREAM_PROXY = process.env.CF_STREAM_PROXY || "https://vidzen-stream-proxy.xdbypass.workers.dev";
@@ -30,6 +32,7 @@ function maskName(name) { return PROVIDER_ALIAS[name] || name; }
 function unmaskName(alias) { return ALIAS_REVERSE[alias] || alias; }
 
 const SERVERS = Object.values(PROVIDER_ALIAS);
+const BETA_PROVIDERS = new Set(["primesrc", "vixsrc", "moviesdrive", "yflix"]);
 
 // The default demo movie ID shown on the landing page
 const DEMO_MOVIE_ID = "786892";
@@ -143,6 +146,7 @@ function normalizePrimeSrc(data) {
       for (const s of server.sources) {
         sources.push({
           url: obfuscateUrl(s.url, "primesrc"),
+          _probeUrl: s.url,  // raw URL for SFB
           type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
           label: server.name || "Default",
           server: maskName("primesrc"),
@@ -167,6 +171,7 @@ function normalizeStream(data) {
   const providerName = payload.providerName || "stream";
   const sources = payload.sources.map(s => ({
     url: obfuscateUrl(s.url, providerName),
+    _probeUrl: s.url,  // raw URL for SFB
     type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
     label: s.server || s.quality || "Default",
     server: maskName(providerName),
@@ -182,6 +187,7 @@ function normalizeMoviebox(data) {
   if (!data?.sources?.length) return null;
   const sources = data.sources.map(s => ({
     url: obfuscateUrl(s.url, "moviebox"),
+    _probeUrl: s.url,  // raw URL for SFB
     type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
     label: [s.quality && `${s.quality}p`, s.dub && s.dub !== "Original" ? s.dub : null].filter(Boolean).join(" ") || "Default",
     server: maskName("moviebox"),
@@ -193,6 +199,7 @@ function normalizePiexe(data) {
   if (!data?.sources?.length) return null;
   const sources = data.sources.map(s => ({
     url: obfuscateUrl(s.url, "piexe"),
+    _probeUrl: s.url,  // raw URL for SFB
     type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
     label: s.label || "Default",
     server: maskName("piexe"),
@@ -217,7 +224,7 @@ function normalizeVidlink(data) {
       url: vaultUrl(decodedUrl, {
         origin: "https://vidlink.pro",
         referer: "https://vidlink.pro/",
-        cfProxy: CF_STREAM_PROXY || null,  // CF Worker handles Origin header
+        redirect: true,  // Browser fetches CDN directly (CDN blocks datacenter IPs)
       }),
       type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
       label: s.quality || s.server || "Auto",
@@ -236,6 +243,7 @@ function normalizeYflix(data) {
   if (!payload?.sources?.length) return null;
   const sources = payload.sources.map(s => ({
     url: obfuscateUrl(s.url, "yflix"),
+    _probeUrl: s.url,  // raw URL for SFB
     type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
     label: s.quality || s.server || "Auto",
     server: maskName("yflix"),
@@ -259,6 +267,9 @@ function normalizeMoviesdrive(data) {
         referer: "https://moviesdrive.design/",
         cfProxy: CF_STREAM_PROXY || null,
       }),
+      _probeUrl: s.url,  // raw URL for SFB
+      _probeOrigin: "https://moviesdrive.design",
+      _probeReferer: "https://moviesdrive.design/",
       type: "mp4",
       label: s.quality || s.source || s.name || s.title || "Auto",
       server: maskName("moviesdrive"),
@@ -280,6 +291,9 @@ function normalizeHdhub4u(data) {
           origin: "https://hubstream.art",
           referer: "https://hubstream.art/",
         }),
+        _probeUrl: s.url,  // raw URL for SFB
+        _probeOrigin: "https://hubstream.art",
+        _probeReferer: "https://hubstream.art/",
         type: "hls",
         label: s.quality || s.source || s.name || s.title || "Auto",
         server: maskName("hdhub4u"),
@@ -289,12 +303,33 @@ function normalizeHdhub4u(data) {
   return { sources, subtitles: [] };
 }
 
+function normalizeVideasy(data) {
+  const payload = data?.data || data;
+  if (data?.success === false || payload?.error) return null;
+  if (!payload?.streams?.length) return null;
+  const sources = payload.streams.map(s => {
+    return {
+      url: vaultUrl(s.url, {
+        origin: s.referer || "https://videasy.net",
+        referer: s.referer || "https://videasy.net/",
+      }),
+      _probeUrl: s.url,  // raw URL for SFB
+      _probeOrigin: s.referer || "https://videasy.net",
+      _probeReferer: s.referer || "https://videasy.net/",
+      type: s.stream_type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
+      label: s.server || s.quality || "Auto",
+      server: maskName("videasy"),
+    };
+  });
+  return { sources, subtitles: [] };
+}
+
 // ── Provider fetch functions ───────────────────────────────────────────────
 function tryPrimeSrc(type, id, season, episode) {
   const path = type === "movie"
     ? `${NB_URL}/movie-tv/primesrc/movie/${id}`
     : `${NB_URL}/movie-tv/primesrc/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 90000).then(normalizePrimeSrc);
+  return fetchJSON(path, 8000).then(normalizePrimeSrc);
 }
 
 function tryVidcore(type, id, season, episode) {
@@ -337,14 +372,14 @@ function tryYflix(type, id, season, episode) {
   const path = type === "movie"
     ? `${NB_URL}/stream/yflix/movie/${id}`
     : `${NB_URL}/stream/yflix/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 25000).then(normalizeYflix);
+  return fetchJSON(path, 8000).then(normalizeYflix);
 }
 
 function tryMoviesdrive(type, id, season, episode) {
   const path = type === "movie"
     ? `${NB_URL}/stream/moviesdrive/movie/${id}`
     : `${NB_URL}/stream/moviesdrive/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 120000).then(normalizeMoviesdrive);
+  return fetchJSON(path, 8000).then(normalizeMoviesdrive);
 }
 
 function tryHdhub4u(type, id, season, episode) {
@@ -365,7 +400,19 @@ function tryVixsrc(type, id, season, episode) {
   const path = type === "movie"
     ? `${NB_URL}/stream/vixsrc/movie/${id}`
     : `${NB_URL}/stream/vixsrc/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 30000).then(normalizeStream);
+  return fetchJSON(path, 8000).then(normalizeStream);
+}
+
+import { scrapeVideasy } from "@/lib/videasy";
+
+async function tryVideasy(type, id, season, episode) {
+  try {
+    const data = await scrapeVideasy(type, id, season, episode);
+    return normalizeVideasy(data);
+  } catch (err) {
+    console.error("[tryVideasy] Error:", err.message || err);
+    return null;
+  }
 }
 
 const PROVIDER_MAP = {
@@ -380,6 +427,7 @@ const PROVIDER_MAP = {
   hdhub4u: tryHdhub4u,
   vidsrc: tryVidsrc,
   vixsrc: tryVixsrc,
+  videasy: tryVideasy,
 };
 
 // Providers excluded from the automatic race (but still available via forced server switch).
@@ -393,10 +441,16 @@ async function raceProviders(type, id, season, episode) {
 
   const racers = entries.map(([name, fn]) => {
     return fn(type, id, season, episode)
-      .then(result => {
+      .then(async result => {
         if (result && result.sources?.length > 0) {
-          console.log(`[sources] ✓ ${maskName(name)} — ${result.sources.length} sources`);
-          return { provider: maskName(name), ...result };
+          // SFB: validate sources before accepting as winner
+          const validated = await validateSources(result);
+          if (validated && validated.sources?.length > 0) {
+            console.log(`[sources] ✓ ${maskName(name)} — ${validated.sources.length} sources`);
+            return { provider: maskName(name), ...validated };
+          }
+          console.log(`[sources] ✗ ${maskName(name)} — SFB rejected all sources`);
+          return null;
         }
         console.log(`[sources] ✗ ${maskName(name)} — no sources`);
         return null;
@@ -444,6 +498,16 @@ export async function GET(request) {
   if (type === "tv" && (!season || !episode)) {
     return Response.json({ error: "Missing ?season= and ?episode= for TV" }, { status: 400 });
   }
+
+  // ── Blocklist check (DMCA / DSA takedown) ──────────────────────────────
+  if (isBlocked({ type, id, season, episode })) {
+    console.log(`[sources] 🚫 BLOCKED (DSA): ${type}/${id}${season ? `/${season}/${episode}` : ""}`);
+    return Response.json(
+      { error: "This content has been removed due to a copyright compliance request.", blocked: true },
+      { status: 451, headers: { "Cache-Control": "no-store" } }
+    );
+  }
+
 
   // ── Check Redis cache first ─────────────────────────────────────────────
   const cacheKey = sourceKey(type, id, forcedServer, season, episode);
@@ -496,16 +560,24 @@ export async function GET(request) {
 
     // Retry once after 2s if first attempt returned nothing
     if (!result?.sources?.length && !lastError?.includes("aborted")) {
-      try {
-        console.log(`[sources] Retrying ${maskName(forcedServer)} after 2s...`);
-        await new Promise(r => setTimeout(r, 2000));
-        result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
-      } catch (err) {
-        lastError = err.message;
-        console.warn(`[sources] ${forcedServer} attempt 2 failed:`, err.message);
+      if (BETA_PROVIDERS.has(forcedServer)) {
+        console.log(`[sources] Skipping retry for BETA provider ${maskName(forcedServer)}`);
+      } else {
+        try {
+          console.log(`[sources] Retrying ${maskName(forcedServer)} after 2s...`);
+          await new Promise(r => setTimeout(r, 2000));
+          result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
+        } catch (err) {
+          lastError = err.message;
+          console.warn(`[sources] ${forcedServer} attempt 2 failed:`, err.message);
+        }
       }
     }
 
+    // SFB: validate forced server sources
+    if (result?.sources?.length) {
+      result = await validateSources(result);
+    }
     if (result?.sources?.length) {
       await cacheSet(cacheKey, stripVaultForCache(result), DEFAULT_TTL);
       return Response.json({
@@ -578,22 +650,25 @@ export async function GET(request) {
 
 function stripVaultForCache(result) {
   const sources = (result.sources || []).map(s => {
+    // Strip _probe* fields (SFB internal — never cache or send to client)
+    const { _probeUrl, _probeOrigin, _probeReferer, ...clean } = s;
     // Resolve vault URL back to raw CDN URL + metadata
-    if (s.url?.startsWith("/api/stream/")) {
-      const vaultId = s.url.split("/").pop();
+    if (clean.url?.startsWith("/api/stream/")) {
+      const vaultId = clean.url.split("/").pop();
       const entry = resolveUrl(vaultId);
       if (entry) {
         return {
-          ...s,
-          url: s.url,            // Keep vault URL for immediate use
+          ...clean,
+          url: clean.url,            // Keep vault URL for immediate use
           _raw: entry.url,       // Store raw CDN URL for cache
           _origin: entry.origin,
           _referer: entry.referer,
           _cfProxy: entry.cfProxy || null,
+          _redirect: entry.redirect || false,
         };
       }
     }
-    return s;
+    return clean;
   });
 
   return {
@@ -611,9 +686,10 @@ function refreshVaultUrls(cached) {
         origin: s._origin || null,
         referer: s._referer || null,
         cfProxy: s._cfProxy || null,
+        redirect: s._redirect || false,
       });
       // Return source with fresh vault URL, strip raw metadata
-      const { _raw, _origin, _referer, _cfProxy, ...rest } = s;
+      const { _raw, _origin, _referer, _cfProxy, _redirect, ...rest } = s;
       return { ...rest, url: freshVaultUrl };
     }
     return s;
