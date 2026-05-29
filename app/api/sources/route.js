@@ -433,7 +433,7 @@ const PROVIDER_MAP = {
 // Providers excluded from the automatic race (but still available via forced server switch).
 // VidLink: storm.vodvidl.site blocks datacenter + CF Worker IPs (only residential works).
 // VixSrc: Cloudflare blocks VPS IPs, explicitly excluded from race.
-const RACE_EXCLUDED = new Set(["yflix", "vixsrc"]);
+const RACE_EXCLUDED = new Set(["yflix", "vixsrc", "primesrc"]);
 
 // ── Parallel Race: fire all, return the FIRST with sources ────────────────
 async function raceProviders(type, id, season, episode) {
