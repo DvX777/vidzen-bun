@@ -8,11 +8,22 @@ export const dynamic = "force-dynamic";
 
 import { resolveUrl, vaultUrl } from "@/lib/streamVault";
 import { classifyHttpError, classifyNetworkError, ErrorClass, isFatal } from "@/lib/sfb";
+import { triggerRenewal } from "@/lib/renewal";
+import { healthIncFail } from "@/lib/redisCache";
 import { execFile } from "child_process";
 import { promisify } from "util";
 import path from "path";
 
 const execFileAsync = promisify(execFile);
+
+// central handler to trigger SRPS background renewals on fatal failures
+function handleFatalFailure(entry, errClass) {
+  if (isFatal(errClass) && entry && entry.provider && entry.mediaId) {
+    console.log(`[Stream] 🚨 SFBS Fatal Error (${errClass}) on ${entry.provider}. Queuing background renewal.`);
+    triggerRenewal(entry.provider, entry.mediaType, entry.mediaId, entry.season, entry.episode).catch(() => {});
+    healthIncFail(entry.provider).catch(() => {});
+  }
+}
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
 
@@ -212,6 +223,7 @@ export async function GET(request, { params }) {
       // If still failing, return fatal error to player
       if (!upstreamRes.ok && upstreamRes.status !== 206) {
         console.error(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}: ${url.substring(0, 100)}`);
+        handleFatalFailure(entry, errClass);
         return new Response(JSON.stringify({ error: "upstream_error", status: upstreamRes.status, class: errClass }), {
           status: 502,
           headers: {
@@ -228,6 +240,7 @@ export async function GET(request, { params }) {
     // ── SFBS: Block HTML responses (usually CDN errors/blocks) ──────────
     if (contentType.includes("text/html") || url.endsWith(".html")) {
       console.error(`[Stream] Upstream returned HTML instead of media for ${id}: ${url.substring(0, 100)}`);
+      handleFatalFailure(entry, ErrorClass.FATAL_INVALID);
       return new Response(JSON.stringify({ error: "invalid_content_type", class: ErrorClass.FATAL_INVALID }), {
         status: 502,
         headers: {
@@ -273,6 +286,7 @@ export async function GET(request, { params }) {
   } catch (err) {
     const errClass = classifyNetworkError(err.message);
     console.error(`[Stream] Proxy error for ${id} (${errClass}):`, err.message);
+    handleFatalFailure(entry, errClass);
     return new Response(JSON.stringify({ error: err.message, class: errClass }), {
       status: 502,
       headers: {

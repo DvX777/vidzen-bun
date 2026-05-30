@@ -103,10 +103,12 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const [meta, setMeta] = useState({ title: "", poster: "", backdrop: "" });
   const [devToolsBlocked, setDevToolsBlocked] = useState(false);
   const [toast, setToast] = useState(null);
-  const [backgroundPolling, setBackgroundPolling] = useState(false);
+  const [sourcePool, setSourcePool] = useState({}); // SRPS source pool
 
   const progressRef = useRef({ time: 0, duration: 0 });
+  const switchingToTimeRef = useRef(0); // Mid-session progress saver
   const saveTimerRef = useRef(null);
+  const hasSyncedPoolRef = useRef(false); // SRPS dynamic pool sync tracker
 
   // ── Current provider's sources ────────────────────────────────────────
   const currentProviderSources = useMemo(() => {
@@ -261,6 +263,11 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     fetchMeta();
   }, [id, type]);
 
+  // Reset pool sync tracker on media change
+  useEffect(() => {
+    hasSyncedPoolRef.current = false;
+  }, [type, id, season, episode]);
+
   // ── Toast notification helper ────────────────────────────────────────
   const showToast = useCallback((message, toastType = 'error') => {
     setToast({ message, type: toastType });
@@ -337,12 +344,8 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       } else {
         setSubtitles(data.subtitles);
       }
+      if (data.sourcePool) setSourcePool(data.sourcePool);
       setSwitching(null);
-      if (data.provider === "vidcore" || data.provider === "vidfast") {
-        setBackgroundPolling(true);
-      } else {
-        setBackgroundPolling(false);
-      }
     } catch (err) {
       console.error("[VidzenPlayer] Source fetch failed:", err.message);
       if (!sourcesRef.current.length) {
@@ -351,57 +354,37 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         showToast(err.message, 'error');
       }
       setSwitching(null);
-      setBackgroundPolling(false);
     }
   }, [type, id, season, episode, showToast]);
 
-  // ── Background Polling for Vidcore/Vidfast ──────────────────────────────
+  // ── SRPS Background Pool Synchronizer ──────────────────────────────────
   useEffect(() => {
-    if (!currentServer || (currentServer !== "vidcore" && currentServer !== "vidfast")) {
-      setBackgroundPolling(false);
-      return;
-    }
+    if (!currentServer || hasSyncedPoolRef.current) return;
 
-    if (!backgroundPolling) return;
-
-    let pollCount = 0;
-    const MAX_POLLS = 6; // 6 polls * 2.5s = 15 seconds
-
-    const pollInterval = setInterval(async () => {
-      pollCount++;
-      if (pollCount >= MAX_POLLS) {
-        setBackgroundPolling(false);
-        clearInterval(pollInterval);
-        return;
-      }
-
+    // Query the API 15 seconds after playback starts to load all slow providers (Vidcore, Vidfast, etc.)
+    // that finished racing in the background and have since cached to Redis.
+    const syncTimeout = setTimeout(async () => {
       try {
         const params = new URLSearchParams({ type, id });
         if (season) params.set("season", season);
         if (episode) params.set("episode", episode);
-        params.set("server", currentServer);
 
         const res = await fetch(`/api/sources?${params}`);
         if (res.ok) {
           const data = await res.json();
-          if (data.sources && data.sources.length > sourcesRef.current.length) {
-            console.log(`[VidzenPlayer] Background sync: found ${data.sources.length} sources (was ${sourcesRef.current.length})`);
-            setSources(data.sources);
-            sourcesRef.current = data.sources;
-
-            // Re-eval subtitles if any new came in
-            if (data.subtitles && data.subtitles.length > 0 && (!subtitles || subtitles.length === 0)) {
-              setSubtitles(data.subtitles);
-            }
+          if (data.sourcePool) {
+            console.log(`[SRPS] Dynamic Background Sync: Loaded fully populated pool containing ${Object.keys(data.sourcePool).join(", ")}`);
+            setSourcePool(data.sourcePool);
+            hasSyncedPoolRef.current = true;
           }
         }
       } catch (err) {
-        console.warn("[VidzenPlayer] Background poll error:", err.message);
+        console.warn("[SRPS] Dynamic Background Sync error:", err.message);
       }
-    }, 2500);
+    }, 15000);
 
-    return () => clearInterval(pollInterval);
-  }, [backgroundPolling, currentServer, type, id, season, episode, subtitles]);
+    return () => clearTimeout(syncTimeout);
+  }, [type, id, season, episode, currentServer]);
 
   // ── Fetch subtitles — FIX: was `tmdb_id`, API expects `id` ─────────────
   const fetchSubtitles = useCallback(async () => {
@@ -472,6 +455,16 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const handleCanPlay = useCallback(() => {
     // Reset error counter — playback succeeded
     errorCountRef.current = 0;
+
+    // 1. Check if we have a mid-session switch time preserved
+    if (switchingToTimeRef.current > 5 && playerRef.current) {
+      console.log(`[SRPS] Restoring mid-session position: ${switchingToTimeRef.current}s`);
+      playerRef.current.currentTime = switchingToTimeRef.current;
+      switchingToTimeRef.current = 0; // Reset
+      return;
+    }
+
+    // 2. Otherwise load from watch history
     const saved = getProgress(type, id, season, episode);
     if (saved && saved.watched > 15 && playerRef.current) {
       playerRef.current.currentTime = saved.watched;
@@ -495,10 +488,8 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
     let statusCode = 0;
 
     // Try to extract HLS error details from Vidstack's error event
-    // err might be a native MediaError, or a custom Vidstack/HLS error object
     const detail = err?.detail || err;
     if (detail) {
-      // HLS.js often includes the HTTP response code for network errors
       if (detail.response && detail.response.code) {
         statusCode = detail.response.code;
         errClass = classifyHttpError(statusCode);
@@ -517,7 +508,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
 
     // ── Fallback Logic ──────────────────────────────────────────────────
     const now = Date.now();
-    
+
     // Only debounce if NOT instantly fatal
     if (!isInstantFatal) {
       if (now - lastErrorTimeRef.current < 500) return;
@@ -530,8 +521,6 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
 
     // If it's a fatal error, or we've hit the error threshold
     if (isInstantFatal || errorCountRef.current >= maxErrors) {
-      // Stop auto-switching if we've completely exhausted retries 
-      // (give 1 extra life if it was instant fatal, otherwise stop at maxErrors + 2)
       if (errorCountRef.current > maxErrors + 2) {
         console.warn("[VidzenPlayer] Too many errors, stopping auto-switch");
         setError("Unable to load stream. Please try a different server.");
@@ -554,6 +543,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       if (nextServer) {
         console.log(`[VidzenPlayer] Failover: ${currentServer} → ${nextServer} (SFBS: ${errClass})`);
         errorCountRef.current = 0;  // Reset for next server
+        switchingToTimeRef.current = progressRef.current.time; // Preserve position!
         fetchSources(nextServer);
       } else {
         setError("All servers are currently unavailable. Please try again later.");
@@ -564,8 +554,36 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
   const switchServer = useCallback((server) => {
     if (server === currentServer) return;
     saveNow();  // Save progress BEFORE switching — no seconds lost
+
+    // Preserve live playback time
+    const savedTime = progressRef.current.time;
+    switchingToTimeRef.current = savedTime;
+    console.log(`[SRPS] Switching server to ${server}. Preserving time: ${savedTime}s`);
+
+    // 1. Instant client-side switch from local pool!
+    if (sourcePool[server]?.sources?.length) {
+      const poolData = sourcePool[server];
+      setSources(poolData.sources);
+      sourcesRef.current = poolData.sources;
+      setCurrentServer(server);
+      setCurrentSourceIndex(0);
+      if (poolData.subtitles?.length) setSubtitles(poolData.subtitles);
+      setSwitching(null);
+      console.log(`[SRPS] Instant switch to ${server} via client-side pool`);
+
+      // Force immediate playback and seek
+      setTimeout(() => {
+        if (playerRef.current) {
+          if (savedTime > 5) playerRef.current.currentTime = savedTime;
+          playerRef.current.play().catch(() => { });
+        }
+      }, 50);
+      return;
+    }
+
+    // 2. Fallback to API query
     fetchSources(server);
-  }, [currentServer, fetchSources, saveNow]);
+  }, [currentServer, sourcePool, fetchSources, saveNow]);
 
   const handlePlay = useCallback(() => {
     if (!playerRef.current) return;
@@ -624,6 +642,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
             const isActive = server === currentServer;
             const isFailed = failedServers.has(server);
             const isBeta = tier === "beta";
+            const isCached = !!sourcePool[server];
 
             // Insert a thin divider when the tier group changes
             const showDivider = lastTier !== null && lastTier !== tier;
@@ -645,7 +664,10 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
                   disabled={isFailed}
                 >
                   {/* Name */}
-                  <span className="vz-srv-name">{info.name}</span>
+                  <span className="vz-srv-name">
+                    {isCached && !isActive && <span style={{ marginRight: 6, color: "#eab308" }} title="Instant Switch (Cached)">⚡</span>}
+                    {info.name}
+                  </span>
                   {/* Badge — each tier has its own SVG icon + styled label */}
                   {tier === "ultra" && (
                     <span className="vz-srv-badge vz-srv-badge-ultra">
@@ -677,7 +699,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         </Menu.Content>
       </Menu.Root>
     );
-  }, [sortedServers, currentServer, failedServers, switchServer]);
+  }, [sortedServers, currentServer, failedServers, switchServer, sourcePool]);
 
   // Quality submenu — ALWAYS shows, even with 1 option like "Auto"
   // Sorted: 360p → 480p → 720p → 1080p

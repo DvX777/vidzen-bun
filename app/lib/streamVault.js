@@ -30,11 +30,7 @@ function ensureCleanup() {
   }, CLEANUP_INTERVAL_MS);
 }
 
-/**
- * Store a real URL behind an opaque ID.
- * @returns {string} opaque hex ID (8 chars)
- */
-export function storeUrl(url, { origin = null, referer = null, cfProxy = null, redirect = false } = {}) {
+export function storeUrl(url, { origin = null, referer = null, cfProxy = null, redirect = false, provider = null, mediaType = null, mediaId = null, season = null, episode = null } = {}) {
   ensureCleanup();
   const id = crypto.randomBytes(4).toString("hex"); // 8-char hex
   store.set(id, {
@@ -43,6 +39,11 @@ export function storeUrl(url, { origin = null, referer = null, cfProxy = null, r
     referer,
     cfProxy,    // CF Worker URL for datacenter-blocked CDNs
     redirect,   // true = 302 redirect to CDN (browser fetches directly)
+    provider,
+    mediaType,
+    mediaId,
+    season,
+    episode,
     expiresAt: Date.now() + VAULT_TTL_MS,
   });
   return id;
@@ -50,7 +51,7 @@ export function storeUrl(url, { origin = null, referer = null, cfProxy = null, r
 
 /**
  * Resolve an opaque ID → real URL + headers.
- * @returns {{ url, origin, referer } | null}
+ * @returns {{ url, origin, referer, provider, mediaType, mediaId, season, episode } | null}
  */
 export function resolveUrl(id) {
   const entry = store.get(id);
@@ -61,7 +62,18 @@ export function resolveUrl(id) {
   }
   // Touch-on-read: extend TTL while stream is actively being used
   entry.expiresAt = Date.now() + VAULT_TTL_MS;
-  return { url: entry.url, origin: entry.origin, referer: entry.referer, cfProxy: entry.cfProxy, redirect: entry.redirect };
+  return {
+    url: entry.url,
+    origin: entry.origin,
+    referer: entry.referer,
+    cfProxy: entry.cfProxy,
+    redirect: entry.redirect,
+    provider: entry.provider,
+    mediaType: entry.mediaType,
+    mediaId: entry.mediaId,
+    season: entry.season,
+    episode: entry.episode,
+  };
 }
 
 /**

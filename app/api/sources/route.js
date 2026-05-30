@@ -1,454 +1,143 @@
 // app/api/sources/route.js
-// Unified provider bridge — races providers in parallel.
-// Now integrates: StreamVault (URL obfuscation) + Redis (response caching).
+// Unified provider bridge for Vidzen using the Smart Racing Provider System (SRPS).
 
 export const runtime = "nodejs";
 
 import { vaultUrl, resolveUrl } from "@/lib/streamVault";
-import { cacheGet, cacheSet, sourceKey, DEFAULT_TTL, DEMO_TTL, NOT_FOUND_TTL } from "@/lib/redisCache";
+import { 
+  cacheGet, 
+  cacheSet, 
+  sourceKey, 
+  cacheGetProvider, 
+  cacheSetProvider, 
+  cacheGetMeta, 
+  cacheSetMeta, 
+  cacheGetAllProviders,
+  isProviderHealthy,
+  DEFAULT_TTL, 
+  DEMO_TTL, 
+  NOT_FOUND_TTL 
+} from "@/lib/redisCache";
 import { isBlocked } from "@/lib/blocklist";
 import { validateSources } from "@/lib/sfb";
+import {
+  PROVIDER_MAP,
+  SERVERS,
+  BETA_PROVIDERS,
+  RACE_EXCLUDED,
+  maskName,
+  unmaskName,
+  stripVaultForCache,
+  refreshVaultUrls
+} from "@/lib/srpsProviders";
 
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
-const CF_STREAM_PROXY = process.env.CF_STREAM_PROXY || "https://vidzen-stream-proxy.xdbypass.workers.dev";
-
-// ── Provider name obfuscation ─────────────────────────────────────────────
-// Internal names → hex IDs (network tab won't reveal provider names)
-const PROVIDER_ALIAS = {
-  primesrc: "sv-c3d5",
-  vidcore: "sv-a1f3",
-  vidfast: "sv-b2e4",
-  moviebox: "sv-d4c6",
-  piexe: "sv-e5b7",
-  vidlink: "sv-f6a8",
-  yflix: "sv-g7b9",
-  moviesdrive: "sv-m8d1",
-  hdhub4u: "sv-h9u4",
-  vidsrc: "sv-v1s3",
-  vixsrc: "sv-v2x4",
-};
-const ALIAS_REVERSE = Object.fromEntries(Object.entries(PROVIDER_ALIAS).map(([k, v]) => [v, k]));
-function maskName(name) { return PROVIDER_ALIAS[name] || name; }
-function unmaskName(alias) { return ALIAS_REVERSE[alias] || alias; }
-
-const SERVERS = Object.values(PROVIDER_ALIAS);
-const BETA_PROVIDERS = new Set(["primesrc", "vixsrc", "moviesdrive", "yflix"]);
-
-// The default demo movie ID shown on the landing page
 const DEMO_MOVIE_ID = "786892";
 
-// Rate-limit primesrc error logging (max once per 60s)
-let lastPrimesrcErrorTime = 0;
-const PRIMESRC_ERROR_INTERVAL_MS = 60_000;
-
-// ── Fetch with AbortController timeout ─────────────────────────────────────
-async function fetchJSON(url, timeoutMs = 15000) {
-  const controller = new AbortController();
-  const id = setTimeout(() => controller.abort(), timeoutMs);
+// Helper to incrementally update/create racing metadata in Redis cache
+async function appendProviderToMeta(type, id, season, episode, providerName, isFirstWinner = false) {
   try {
-    const headers = {};
-    // Add API key for backend.vidzen.fun requests (nginx auth)
-    if (url.includes("backend.vidzen.fun") || url.startsWith(NB_URL)) {
-      headers["X-API-Key"] = process.env.API_GATEWAY_KEY || "";
-    }
-    const res = await fetch(url, { signal: controller.signal, headers });
-    clearTimeout(id);
-    const text = await res.text();
-    try {
-      return JSON.parse(text);
-    } catch {
-      // Rate-limit primesrc error logging (once per 60s instead of full suppression)
-      if (url.includes("primesrc")) {
-        const now = Date.now();
-        if (now - lastPrimesrcErrorTime > PRIMESRC_ERROR_INTERVAL_MS) {
-          lastPrimesrcErrorTime = now;
-          console.warn(`[fetchJSON] primesrc returned non-JSON (CF bypass likely failed). Status: ${res.status}`);
-        }
-      } else {
-        // For vidcore/vidfast 502s, include status code for debugging
-        const statusHint = res.status >= 500 ? ` [HTTP ${res.status}]` : '';
-        console.error(`[fetchJSON]${statusHint} Non-JSON response from ${url.substring(0, 80)}: ${text.substring(0, 100)}`);
+    const meta = await cacheGetMeta(type, id, season, episode);
+    if (meta) {
+      if (!meta.providers.includes(providerName)) {
+        meta.providers.push(providerName);
+        await cacheSetMeta(type, id, season, episode, meta);
+        console.log(`[sources] Appended ${providerName} to cached meta for ${type}/${id}`);
       }
-      return null;
+    } else if (isFirstWinner) {
+      const newMeta = {
+        providers: [providerName],
+        racedAt: Date.now(),
+        firstWinner: maskName(providerName),
+      };
+      await cacheSetMeta(type, id, season, episode, newMeta);
+      console.log(`[sources] Initial Meta created for ${type}/${id} with firstWinner: ${providerName}`);
     }
   } catch (err) {
-    clearTimeout(id);
-    throw err;
+    console.warn(`[sources] Failed to update meta for ${providerName}:`, err.message);
   }
 }
 
-// ── Unwrap nb-system proxy URLs → extract real CDN URL + headers ────────────
-// /proxy/m3u8-proxy?url=<encoded_cdn>&headers=<encoded_headers>
-// → { url: "https://cdn.example.com/stream.m3u8", referer: "...", origin: "..." }
-function unwrapProxyUrl(proxyPath) {
-  if (!proxyPath || !proxyPath.startsWith("/proxy/")) return null;
-  const qIdx = proxyPath.indexOf("?");
-  if (qIdx === -1) return null;
-  try {
-    const params = new URLSearchParams(proxyPath.substring(qIdx + 1));
-    const cdnUrl = params.get("url");
-    if (!cdnUrl) return null;
-    let referer = null, origin = null;
-    const headersStr = params.get("headers");
-    if (headersStr) {
-      try {
-        const h = JSON.parse(decodeURIComponent(headersStr));
-        referer = h.referer || h.Referer || null;
-        origin = h.origin || h.Origin || null;
-      } catch { }
-    }
-    return { url: cdnUrl, referer, origin };
-  } catch {
-    return null;
-  }
-}
-
-// ── Rewrite relative proxy URLs to absolute URLs (fallback) ─────────────────
-function rewriteProxyUrl(url) {
-  if (!url) return url;
-  if (url.startsWith("/proxy/")) return `${NB_URL}${url}`;
-  if (url.startsWith("/api/") || url.startsWith("/")) {
-    const origin = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
-    return `${origin}${url}`;
-  }
-  return url;
-}
-
-// ── Vault a source URL — returns /api/stream/{id} ──────────────────────────
-function obfuscateUrl(url, server) {
-  if (!url) return url;
-
-  // Direct CDN extraction from nb-system proxy paths
-  // Skip the VPS proxy entirely — fetch from CDN directly
-  const unwrapped = unwrapProxyUrl(url);
-  if (unwrapped) {
-    return vaultUrl(unwrapped.url, {
-      origin: unwrapped.origin,
-      referer: unwrapped.referer,
-    });
-  }
-
-  // Normal URL — resolve and vault
-  const resolved = rewriteProxyUrl(url);
-  return vaultUrl(resolved, {
-    origin: server === "moviebox" ? null : NB_URL,
-    referer: server === "moviebox" ? null : NB_URL,
-  });
-}
-
-// ── Normalize each provider's response ─────────────────────────────────────
-function normalizePrimeSrc(data) {
-  if (!data?.success || !data?.data?.length) return null;
-  const sources = [];
-  const subtitles = [];
-  for (const server of data.data) {
-    if (server.sources) {
-      for (const s of server.sources) {
-        sources.push({
-          url: obfuscateUrl(s.url, "primesrc"),
-          _probeUrl: s.url,  // raw URL for SFB
-          type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-          label: server.name || "Default",
-          server: maskName("primesrc"),
-        });
-      }
-    }
-    if (server.subtitles) {
-      for (const sub of server.subtitles) {
-        subtitles.push({ url: sub.url, lang: sub.label || sub.lang || "Unknown" });
-      }
-    }
-  }
-  if (!sources.length) return null;
-  return { sources, subtitles };
-}
-
-function normalizeStream(data) {
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  if (!payload?.sources?.length) return null;
-
-  const providerName = payload.providerName || "stream";
-  const sources = payload.sources.map(s => ({
-    url: obfuscateUrl(s.url, providerName),
-    _probeUrl: s.url,  // raw URL for SFB
-    type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-    label: s.server || s.quality || "Default",
-    server: maskName(providerName),
-  }));
-  const subtitles = (payload.subtitles || []).map(s => ({
-    url: s.url,
-    lang: s.label || s.lang || "Unknown",
-  }));
-  return { sources, subtitles };
-}
-
-function normalizeMoviebox(data) {
-  if (!data?.sources?.length) return null;
-  const sources = data.sources.map(s => ({
-    url: obfuscateUrl(s.url, "moviebox"),
-    _probeUrl: s.url,  // raw URL for SFB
-    type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-    label: [s.quality && `${s.quality}p`, s.dub && s.dub !== "Original" ? s.dub : null].filter(Boolean).join(" ") || "Default",
-    server: maskName("moviebox"),
-  }));
-  return { sources, subtitles: [] };
-}
-
-function normalizePiexe(data) {
-  if (!data?.sources?.length) return null;
-  const sources = data.sources.map(s => ({
-    url: obfuscateUrl(s.url, "piexe"),
-    _probeUrl: s.url,  // raw URL for SFB
-    type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-    label: s.label || "Default",
-    server: maskName("piexe"),
-  }));
-  return { sources, subtitles: [] };
-}
-
-function normalizeVidlink(data) {
-  // Unwrap backend envelope: { status, success, data: { sources, subtitles } }
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  if (!payload?.sources?.length) return null;
-  const sources = payload.sources.map(s => {
-    // storm.vodvidl.site is VidLink's own CORS proxy.
-    // It only checks Origin header (must be vidlink.pro), NOT the client IP.
-    // Strategy: keep the storm URL as-is, route through our CF Worker.
-    // CF Worker sets Origin: vidlink.pro → storm accepts → fetches from real CDN.
-    // This works from any IP (VPS, Vercel, consumer) because storm doesn't block IPs.
-    const decodedUrl = decodeURIComponent(s.url);
-
-    return {
-      url: vaultUrl(decodedUrl, {
-        origin: "https://vidlink.pro",
-        referer: "https://vidlink.pro/",
-        redirect: true,  // Browser fetches CDN directly (CDN blocks datacenter IPs)
-      }),
-      type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-      label: s.quality || s.server || "Auto",
-      server: maskName("vidlink"),
-    };
-  });
-  // Drop VidLink's own subtitles (megafiles.store — dead/timeout)
-  // Vidzen's /api/subs system handles subtitles independently
-  return { sources, subtitles: [] };
-}
-
-function normalizeYflix(data) {
-  // Unwrap backend envelope: { status, success, data: { sources, subtitles } }
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  if (!payload?.sources?.length) return null;
-  const sources = payload.sources.map(s => ({
-    url: obfuscateUrl(s.url, "yflix"),
-    _probeUrl: s.url,  // raw URL for SFB
-    type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
-    label: s.quality || s.server || "Auto",
-    server: maskName("yflix"),
-  }));
-  const subtitles = (payload.subtitles || []).map(s => ({
-    url: s.url,
-    lang: s.label || s.lang || "Unknown",
-  }));
-  return { sources, subtitles };
-}
-
-function normalizeMoviesdrive(data) {
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  const streams = payload?.sources || payload?.streams || (Array.isArray(payload) ? payload : []);
-  if (!streams.length) return null;
-  const sources = streams.map(s => {
-    return {
-      url: vaultUrl(s.url, {
-        origin: "https://moviesdrive.design",
-        referer: "https://moviesdrive.design/",
-        cfProxy: CF_STREAM_PROXY || null,
-      }),
-      _probeUrl: s.url,  // raw URL for SFB
-      _probeOrigin: "https://moviesdrive.design",
-      _probeReferer: "https://moviesdrive.design/",
-      type: "mp4",
-      label: s.quality || s.source || s.name || s.title || "Auto",
-      server: maskName("moviesdrive"),
-    };
-  });
-  return { sources, subtitles: [] };
-}
-
-function normalizeHdhub4u(data) {
-  const payload = data?.data || data;
-  if (data?.success === false || payload?.error) return null;
-  const streams = payload?.sources || payload?.streams || (Array.isArray(payload) ? payload : []);
-  if (!streams.length) return null;
-  const sources = streams
-    .filter(s => s.url && s.url.includes('.m3u8'))
-    .map(s => {
-      return {
-        url: vaultUrl(s.url, {
-          origin: "https://hubstream.art",
-          referer: "https://hubstream.art/",
-        }),
-        _probeUrl: s.url,  // raw URL for SFB
-        _probeOrigin: "https://hubstream.art",
-        _probeReferer: "https://hubstream.art/",
-        type: "hls",
-        label: s.quality || s.source || s.name || s.title || "Auto",
-        server: maskName("hdhub4u"),
-      };
-    });
-  if (sources.length === 0) return null;
-  return { sources, subtitles: [] };
-}
-
-// ── Provider fetch functions ───────────────────────────────────────────────
-function tryPrimeSrc(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/movie-tv/primesrc/movie/${id}`
-    : `${NB_URL}/movie-tv/primesrc/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 8000).then(normalizePrimeSrc);
-}
-
-function tryVidcore(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/vidcore/movie/${id}`
-    : `${NB_URL}/stream/vidcore/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 180000).then(normalizeStream);
-}
-
-function tryVidfast(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/vidfast/movie/${id}`
-    : `${NB_URL}/stream/vidfast/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 180000).then(normalizeStream);
-}
-
-function tryMoviebox(type, id, season, episode) {
-  const path = type === "movie"
-    ? `/api/peach/moviebox/movie/${id}`
-    : `/api/peach/moviebox/tv/${id}/season/${season}/episode/${episode}`;
-  const origin = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
-  return fetchJSON(`${origin}${path}`, 15000).then(normalizeMoviebox);
-}
-
-function tryPiexe(type, id, season, episode) {
-  const origin = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
-  const params = new URLSearchParams({ id, type });
-  if (season) { params.set("season", season); params.set("ep", episode); }
-  return fetchJSON(`${origin}/api/piexe?${params}`, 15000).then(normalizePiexe);
-}
-
-function tryVidlink(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/vidlink/movie/${id}`
-    : `${NB_URL}/stream/vidlink/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 15000).then(normalizeVidlink);
-}
-
-function tryYflix(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/yflix/movie/${id}`
-    : `${NB_URL}/stream/yflix/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 8000).then(normalizeYflix);
-}
-
-function tryMoviesdrive(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/moviesdrive/movie/${id}`
-    : `${NB_URL}/stream/moviesdrive/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 8000).then(normalizeMoviesdrive);
-}
-
-function tryHdhub4u(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/hdhub4u/movie/${id}`
-    : `${NB_URL}/stream/hdhub4u/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 120000).then(normalizeHdhub4u);
-}
-
-function tryVidsrc(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/vidsrc/movie/${id}`
-    : `${NB_URL}/stream/vidsrc/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 30000).then(normalizeStream);
-}
-
-function tryVixsrc(type, id, season, episode) {
-  const path = type === "movie"
-    ? `${NB_URL}/stream/vixsrc/movie/${id}`
-    : `${NB_URL}/stream/vixsrc/tv/${id}/${season}/${episode}`;
-  return fetchJSON(path, 8000).then(normalizeStream);
-}
-
-const PROVIDER_MAP = {
-  primesrc: tryPrimeSrc,
-  vidcore: tryVidcore,
-  vidfast: tryVidfast,
-  moviebox: tryMoviebox,
-  piexe: tryPiexe,
-  vidlink: tryVidlink,
-  yflix: tryYflix,
-  moviesdrive: tryMoviesdrive,
-  hdhub4u: tryHdhub4u,
-  vidsrc: tryVidsrc,
-  vixsrc: tryVixsrc,
-};
-
-// Providers excluded from the automatic race (but still available via forced server switch).
-// VidLink: storm.vodvidl.site blocks datacenter + CF Worker IPs (only residential works).
-// VixSrc: Cloudflare blocks VPS IPs, explicitly excluded from race.
-const RACE_EXCLUDED = new Set(["yflix", "vixsrc", "primesrc"]);
-
-// ── Parallel Race: fire all, return the FIRST with sources ────────────────
-async function raceProviders(type, id, season, episode) {
+// ── Parallel Race with 15s Timeout Cap and Background caching ───────────────
+async function raceAndCacheAll(type, id, season, episode) {
   const entries = Object.entries(PROVIDER_MAP).filter(([name]) => !RACE_EXCLUDED.has(name));
+  
+  // Filter unhealthy providers
+  const healthyEntries = [];
+  for (const [name, fn] of entries) {
+    const healthy = await isProviderHealthy(name);
+    if (healthy) {
+      healthyEntries.push([name, fn]);
+    } else {
+      console.log(`[sources] 🚫 Skipping unhealthy provider ${maskName(name)} from race`);
+    }
+  }
 
-  const racers = entries.map(([name, fn]) => {
-    return fn(type, id, season, episode)
-      .then(async result => {
+  if (healthyEntries.length === 0) {
+    console.warn("[sources] ⚠️ No healthy providers. Using all as fallback.");
+    healthyEntries.push(...entries);
+  }
+
+  let firstWinner = null;
+  let firstWinnerResolve = null;
+  
+  const firstWinnerPromise = new Promise((resolve) => {
+    firstWinnerResolve = resolve;
+  });
+
+  let completedCount = 0;
+  const totalCount = healthyEntries.length;
+
+  healthyEntries.forEach(([name, fn]) => {
+    fn(type, id, season, episode)
+      .then(async (result) => {
         if (result && result.sources?.length > 0) {
-          // SFB: validate sources before accepting as winner
           const validated = await validateSources(result);
           if (validated && validated.sources?.length > 0) {
             console.log(`[sources] ✓ ${maskName(name)} — ${validated.sources.length} sources`);
-            return { provider: maskName(name), ...validated };
+            
+            // Cache individual provider sources immediately
+            const cleanCached = stripVaultForCache(validated);
+            await cacheSetProvider(type, id, season, episode, name, cleanCached);
+            
+            let isFirst = false;
+            if (!firstWinner) {
+              firstWinner = { provider: maskName(name), ...validated };
+              isFirst = true;
+              firstWinnerResolve(firstWinner);
+            }
+            
+            // Incrementally append to metadata immediately
+            appendProviderToMeta(type, id, season, episode, name, isFirst).catch(() => {});
+            return;
           }
-          console.log(`[sources] ✗ ${maskName(name)} — SFB rejected all sources`);
-          return null;
         }
         console.log(`[sources] ✗ ${maskName(name)} — no sources`);
-        return null;
       })
-      .catch(err => {
-        console.log(`[sources] ✗ ${maskName(name)} — ${err.message}`);
-        return null;
+      .catch((err) => {
+        console.log(`[sources] ✗ ${maskName(name)} — error: ${err.message}`);
+      })
+      .finally(() => {
+        completedCount++;
+        if (completedCount >= totalCount) {
+          firstWinnerResolve(null); // Resolve if all finish and none won
+        }
       });
   });
 
-  return new Promise((resolve) => {
-    let remaining = racers.length;
-    let resolved = false;
-
-    racers.forEach(p => {
-      p.then(result => {
-        if (resolved) return;
-        if (result) {
-          resolved = true;
-          resolve(result);
-          return;
-        }
-        remaining--;
-        if (remaining <= 0) {
-          resolve(null);
-        }
-      });
-    });
+  // 15-second racing timeout cap
+  const timeoutPromise = new Promise((resolve) => {
+    setTimeout(() => {
+      console.log("[sources] ⏱️ Race 15s timeout cap reached. Returning best effort pool.");
+      resolve(null);
+    }, 15000);
   });
+
+  const winner = await Promise.race([firstWinnerPromise, timeoutPromise]);
+  return winner || firstWinner;
 }
 
-// ── Route Handler ──────────────────────────────────────────────────────────
+// ── GET Route Handler ───────────────────────────────────────────────────────
 export async function GET(request) {
   const { searchParams } = new URL(request.url);
   const type = searchParams.get("type") || "movie";
@@ -457,6 +146,7 @@ export async function GET(request) {
   const episode = searchParams.get("episode");
   const rawServer = searchParams.get("server");
   const forcedServer = rawServer ? unmaskName(rawServer) : null;
+  const renew = searchParams.get("renew") === "true";
 
   if (!id) {
     return Response.json({ error: "Missing ?id= parameter" }, { status: 400 });
@@ -465,7 +155,7 @@ export async function GET(request) {
     return Response.json({ error: "Missing ?season= and ?episode= for TV" }, { status: 400 });
   }
 
-  // ── Blocklist check (DMCA / DSA takedown) ──────────────────────────────
+  // Blocklist check
   if (isBlocked({ type, id, season, episode })) {
     console.log(`[sources] 🚫 BLOCKED (DSA): ${type}/${id}${season ? `/${season}/${episode}` : ""}`);
     return Response.json(
@@ -474,78 +164,48 @@ export async function GET(request) {
     );
   }
 
+  const mediaCtx = { type, id, season, episode };
 
-  // ── Check Redis cache first ─────────────────────────────────────────────
-  const cacheKey = sourceKey(type, id, forcedServer, season, episode);
-  const cached = await cacheGet(cacheKey);
-  if (cached) {
-    // Re-vault cached URLs (creates fresh in-memory vault entries from stored raw URLs)
-    const refreshed = refreshVaultUrls(cached);
+  // ── Path 2: Server Switch / Direct Server Query ────────────────────────────
+  if (forcedServer) {
+    if (!PROVIDER_MAP[forcedServer]) {
+      return Response.json({ error: `Unknown server alias: ${rawServer}` }, { status: 400 });
+    }
 
-    // Check if re-vaulting worked (old cache without _raw data can't be refreshed)
-    const firstUrl = refreshed.sources?.[0]?.url;
-    if (firstUrl && firstUrl.startsWith("/api/stream/")) {
-      const vaultId = firstUrl.split("/").pop();
-      if (!resolveUrl(vaultId)) {
-        // Cache has old-format data (no _raw) with dead vault IDs — skip, refetch
-        console.log(`[sources] CACHE STALE (no raw URLs): ${cacheKey} — refetching`);
-        // Fall through to fresh fetch below
-      } else {
-        console.log(`[sources] CACHE HIT: ${cacheKey}`);
+    // 1. Check Redis cache first (if not forcing renewal)
+    if (!renew) {
+      const cached = await cacheGetProvider(type, id, season, episode, forcedServer);
+      if (cached?.sources?.length) {
+        const refreshed = refreshVaultUrls(cached, mediaCtx);
+        console.log(`[sources] DIRECT CACHE HIT: ${rawServer} for ${type}/${id}`);
         return Response.json({
           ...refreshed,
-          provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
+          provider: maskName(forcedServer),
           servers: SERVERS,
           cached: true,
         }, { headers: { "Cache-Control": "no-store" } });
       }
-    } else {
-      // Non-vault URLs (shouldn't happen normally) — return as-is
-      console.log(`[sources] CACHE HIT: ${cacheKey}`);
-      return Response.json({
-        ...refreshed,
-        provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
-        servers: SERVERS,
-        cached: true,
-      }, { headers: { "Cache-Control": "no-store" } });
     }
-  }
 
-  // ── Forced server (with retry + stale cache fallback) ─────────────────
-  if (forcedServer && PROVIDER_MAP[forcedServer]) {
-    // Attempt 1
+    // 2. Cache MISS (or renew=true) -> Query single provider
     let result = null;
     let lastError = null;
     try {
-      console.log(`[sources] Forced server: ${maskName(forcedServer)} for ${type}/${id}`);
+      console.log(`[sources] Forced query: ${maskName(forcedServer)} for ${type}/${id}`);
       result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
     } catch (err) {
       lastError = err.message;
-      console.warn(`[sources] ${forcedServer} attempt 1 failed:`, err.message);
+      console.warn(`[sources] ${forcedServer} query failed:`, err.message);
     }
 
-    // Retry once after 2s if first attempt returned nothing
-    if (!result?.sources?.length && !lastError?.includes("aborted")) {
-      if (BETA_PROVIDERS.has(forcedServer)) {
-        console.log(`[sources] Skipping retry for BETA provider ${maskName(forcedServer)}`);
-      } else {
-        try {
-          console.log(`[sources] Retrying ${maskName(forcedServer)} after 2s...`);
-          await new Promise(r => setTimeout(r, 2000));
-          result = await PROVIDER_MAP[forcedServer](type, id, season, episode);
-        } catch (err) {
-          lastError = err.message;
-          console.warn(`[sources] ${forcedServer} attempt 2 failed:`, err.message);
-        }
-      }
-    }
-
-    // SFB: validate forced server sources
+    // SFB validate sources
     if (result?.sources?.length) {
       result = await validateSources(result);
     }
+
     if (result?.sources?.length) {
-      await cacheSet(cacheKey, stripVaultForCache(result), DEFAULT_TTL);
+      const cleanData = stripVaultForCache(result);
+      await cacheSetProvider(type, id, season, episode, forcedServer, cleanData);
       return Response.json({
         ...result,
         provider: maskName(forcedServer),
@@ -553,118 +213,88 @@ export async function GET(request) {
       }, { headers: { "Cache-Control": "no-store" } });
     }
 
-    // Stale cache fallback: check if we have cached race results (without server suffix)
-    const raceCacheKey = sourceKey(type, id, null, season, episode);
-    const staleFallback = await cacheGet(raceCacheKey);
-    if (staleFallback?.sources?.length) {
-      const refreshed = refreshVaultUrls(staleFallback);
-      // Only use fallback if vault URLs are alive (refreshed successfully)
-      const firstRefreshedUrl = refreshed.sources?.[0]?.url;
-      if (firstRefreshedUrl?.startsWith("/api/stream/")) {
-        const testId = firstRefreshedUrl.split("/").pop();
-        if (resolveUrl(testId)) {
-          console.log(`[sources] ${maskName(forcedServer)} failed but found live stale cache — using fallback`);
-          return Response.json({
-            ...refreshed,
-            provider: refreshed.provider || refreshed.sources?.[0]?.server || null,
-            servers: SERVERS,
-            cached: true,
-            fallback: true,
-          }, { headers: { "Cache-Control": "no-store" } });
-        }
-      }
-      console.log(`[sources] Stale fallback has dead vault URLs — skipping`);
-    }
-
-    // Distinguish error type for the client
+    // Return direct query error response
     const errorMsg = lastError?.includes("502") || lastError?.includes("timed out")
-      ? `${maskName(forcedServer)} is temporarily unreachable (server issue)`
+      ? `${maskName(forcedServer)} is temporarily unreachable`
       : `${maskName(forcedServer)} returned no sources`;
 
-    await cacheSet(cacheKey, { sources: [], subtitles: [], provider: null, error: errorMsg }, NOT_FOUND_TTL);
     return Response.json({
       sources: [], subtitles: [], provider: null, servers: SERVERS,
       error: errorMsg,
     }, { status: 200, headers: { "Cache-Control": "no-store" } });
   }
 
-  // ── Race ALL providers ──────────────────────────────────────────────────
-  console.log(`[sources] Racing all providers for ${type}/${id}...`);
-  const winner = await raceProviders(type, id, season, episode);
+  // ── Path 1: Initial Load (aggregate pool) ──────────────────────────────────
+  if (!renew) {
+    const meta = await cacheGetMeta(type, id, season, episode);
+    if (meta?.providers?.length) {
+      console.log(`[sources] META HIT: Loading pool for ${type}/${id}: ${meta.providers.join(", ")}`);
+      
+      const poolRaw = await cacheGetAllProviders(type, id, season, episode, meta.providers);
+      const sourcePool = {};
+      let activeProvider = null;
+      let activeSources = [];
+      let activeSubtitles = [];
+
+      for (const providerName of meta.providers) {
+        const cachedProviderData = poolRaw[providerName];
+        if (cachedProviderData?.sources?.length) {
+          const refreshed = refreshVaultUrls(cachedProviderData, mediaCtx);
+          const alias = maskName(providerName);
+          sourcePool[alias] = refreshed;
+          
+          // Select initial active provider (prefer firstWinner)
+          if (providerName === meta.firstWinner || !activeProvider) {
+            activeProvider = alias;
+            activeSources = refreshed.sources;
+            activeSubtitles = refreshed.subtitles;
+          }
+        }
+      }
+
+      if (activeSources.length > 0) {
+        return Response.json({
+          sources: activeSources,
+          subtitles: activeSubtitles,
+          provider: activeProvider,
+          servers: SERVERS,
+          sourcePool,
+          cached: true,
+        }, { headers: { "Cache-Control": "no-store" } });
+      }
+    }
+  }
+
+  // Cache MISS -> Run Race
+  console.log(`[sources] Pool Cache MISS. Racing all providers for ${type}/${id}...`);
+  const winner = await raceAndCacheAll(type, id, season, episode);
 
   if (winner) {
-    // Use longer TTL for the demo movie
-    const ttl = id === DEMO_MOVIE_ID ? DEMO_TTL : DEFAULT_TTL;
-    await cacheSet(cacheKey, stripVaultForCache(winner), ttl);
+    // Generate pool of what finished so far
+    const sourcePool = {};
+    const meta = await cacheGetMeta(type, id, season, episode);
+    const providersList = meta?.providers || [unmaskName(winner.provider)];
+    
+    const poolRaw = await cacheGetAllProviders(type, id, season, episode, providersList);
+    for (const providerName of providersList) {
+      const cachedData = poolRaw[providerName];
+      if (cachedData?.sources?.length) {
+        sourcePool[maskName(providerName)] = refreshVaultUrls(cachedData, mediaCtx);
+      }
+    }
+
     return Response.json({
       ...winner,
       servers: SERVERS,
+      sourcePool,
     }, { headers: { "Cache-Control": "no-store" } });
   }
 
-  await cacheSet(cacheKey, { sources: [], subtitles: [], provider: null, error: "All providers failed" }, NOT_FOUND_TTL);
+  // Absolute fallback if all race items fail
   return Response.json({
-    sources: [], subtitles: [], provider: null, servers: SERVERS,
+    sources: [], subtitles: [], provider: null, servers: SERVERS, sourcePool: {},
     error: "All providers failed to return sources",
   }, { status: 200, headers: { "Cache-Control": "no-store" } });
-}
-
-// ── Helpers for cache ─────────────────────────────────────────────────────
-// Vault URLs are ephemeral (in-memory, die on restart).
-// Redis is persistent (survives restarts).
-// Fix: cache RAW CDN URLs + metadata → re-vault on cache hit.
-
-function stripVaultForCache(result) {
-  const sources = (result.sources || []).map(s => {
-    // Strip _probe* fields (SFB internal — never cache or send to client)
-    const { _probeUrl, _probeOrigin, _probeReferer, ...clean } = s;
-    // Resolve vault URL back to raw CDN URL + metadata
-    if (clean.url?.startsWith("/api/stream/")) {
-      const vaultId = clean.url.split("/").pop();
-      const entry = resolveUrl(vaultId);
-      if (entry) {
-        return {
-          ...clean,
-          url: clean.url,            // Keep vault URL for immediate use
-          _raw: entry.url,       // Store raw CDN URL for cache
-          _origin: entry.origin,
-          _referer: entry.referer,
-          _cfProxy: entry.cfProxy || null,
-          _redirect: entry.redirect || false,
-        };
-      }
-    }
-    return clean;
-  });
-
-  return {
-    provider: result.provider,
-    sources,
-    subtitles: result.subtitles || [],
-  };
-}
-
-function refreshVaultUrls(cached) {
-  const sources = (cached.sources || []).map(s => {
-    // If raw URL is stored, re-vault it (creates fresh in-memory entry)
-    if (s._raw) {
-      const freshVaultUrl = vaultUrl(s._raw, {
-        origin: s._origin || null,
-        referer: s._referer || null,
-        cfProxy: s._cfProxy || null,
-        redirect: s._redirect || false,
-      });
-      // Return source with fresh vault URL, strip raw metadata
-      const { _raw, _origin, _referer, _cfProxy, _redirect, ...rest } = s;
-      return { ...rest, url: freshVaultUrl };
-    }
-    return s;
-  });
-
-  return {
-    ...cached,
-    sources,
-  };
 }
 
 export async function OPTIONS() {

@@ -166,4 +166,76 @@ export function sourceKey(type, id, server = null, season = null, episode = null
   return key;
 }
 
+// ── SRPS Provider-specific and Health Cache APIs ────────────────────────
+
+export function providerKey(type, id, provider, season = null, episode = null) {
+  return sourceKey(type, id, provider, season, episode);
+}
+
+export async function cacheSetProvider(type, id, season, ep, provider, data, ttl = DEFAULT_TTL) {
+  const key = providerKey(type, id, provider, season, ep);
+  return cacheSet(key, data, ttl);
+}
+
+export async function cacheGetProvider(type, id, season, ep, provider) {
+  const key = providerKey(type, id, provider, season, ep);
+  return cacheGet(key);
+}
+
+export function metaKey(type, id, season = null, episode = null) {
+  return sourceKey(type, id, "__meta", season, episode);
+}
+
+export async function cacheSetMeta(type, id, season, ep, meta) {
+  const key = metaKey(type, id, season, ep);
+  return cacheSet(key, meta, DEFAULT_TTL);
+}
+
+export async function cacheGetMeta(type, id, season, ep) {
+  const key = metaKey(type, id, season, ep);
+  return cacheGet(key);
+}
+
+export async function cacheGetAllProviders(type, id, season, ep, providerList) {
+  const results = {};
+  const promises = providerList.map(async (provider) => {
+    try {
+      const cached = await cacheGetProvider(type, id, season, ep, provider);
+      if (cached) {
+        results[provider] = cached;
+      }
+    } catch (err) {
+      console.warn(`[Redis] Error getting cached provider ${provider}:`, err.message);
+    }
+  });
+  await Promise.all(promises);
+  return results;
+}
+
+export async function healthIncFail(providerName) {
+  const key = `health:${providerName}:fail`;
+  try {
+    const count = (await cacheGet(key)) || 0;
+    await cacheSet(key, count + 1, 600); // 10 min TTL
+    console.log(`[Redis] Health Failure for ${providerName}: ${count + 1}/3`);
+  } catch (err) {
+    console.warn(`[Redis] healthIncFail error:`, err.message);
+  }
+}
+
+export async function healthGetFails(providerName) {
+  const key = `health:${providerName}:fail`;
+  try {
+    return (await cacheGet(key)) || 0;
+  } catch {
+    return 0;
+  }
+}
+
+export async function isProviderHealthy(providerName) {
+  const fails = await healthGetFails(providerName);
+  return fails < 3;
+}
+
 export { DEFAULT_TTL, DEMO_TTL, NOT_FOUND_TTL };
+
