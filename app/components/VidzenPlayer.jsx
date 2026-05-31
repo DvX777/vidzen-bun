@@ -566,24 +566,51 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
       setSources(poolData.sources);
       sourcesRef.current = poolData.sources;
       setCurrentServer(server);
-      setCurrentSourceIndex(0);
-      if (poolData.subtitles?.length) setSubtitles(poolData.subtitles);
+      
+      // Select the best quality index matching currentQuality or target 480p
+      const newSources = poolData.sources;
+      let bestIdx = 0;
+      let bestDiff = Infinity;
+      let foundExactQuality = false;
+
+      newSources.forEach((s, i) => {
+        const { quality } = parseSourceLabel(s.label);
+        if (quality === currentQuality) {
+          bestIdx = i;
+          foundExactQuality = true;
+        }
+      });
+
+      if (!foundExactQuality) {
+        // Fallback to target 480p quality selection
+        const TARGET_Q = 480;
+        newSources.forEach((s, i) => {
+          const m = (s.label || "").match(/(\d{3,4})p/i);
+          const q = m ? parseInt(m[1]) : 0;
+          const diff = Math.abs(q - TARGET_Q);
+          if (q > 0 && diff < bestDiff) {
+            bestDiff = diff;
+            bestIdx = i;
+          }
+        });
+      }
+      setCurrentSourceIndex(bestIdx);
+
+      if (poolData.subtitles?.length) {
+        setSubtitles(poolData.subtitles);
+      } else {
+        // Fetch fresh subtitles if the pool doesn't have them
+        fetchSubtitles();
+      }
+
       setSwitching(null);
       console.log(`[SRPS] Instant switch to ${server} via client-side pool`);
-
-      // Force immediate playback and seek
-      setTimeout(() => {
-        if (playerRef.current) {
-          if (savedTime > 5) playerRef.current.currentTime = savedTime;
-          playerRef.current.play().catch(() => { });
-        }
-      }, 50);
       return;
     }
 
     // 2. Fallback to API query
     fetchSources(server);
-  }, [currentServer, sourcePool, fetchSources, saveNow]);
+  }, [currentServer, sourcePool, fetchSources, saveNow, currentQuality, fetchSubtitles]);
 
   const handlePlay = useCallback(() => {
     if (!playerRef.current) return;
@@ -893,7 +920,7 @@ export default function VidzenPlayer({ type = "movie", id, season, episode }) {
         }
       `}</style>
       <MediaPlayer
-        key={currentServer || "init"}
+        key={`${type}-${id}-${season || 0}-${episode || 0}`}
         ref={playerRef}
         src={hasSources ? { src: playerSrc, type: playerType } : ""}
         title={displayTitle}
