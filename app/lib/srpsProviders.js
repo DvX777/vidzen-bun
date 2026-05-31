@@ -150,8 +150,8 @@ export function maskName(name) { return PROVIDER_ALIAS[name] || name; }
 export function unmaskName(alias) { return ALIAS_REVERSE[alias] || alias; }
 
 export const SERVERS = Object.values(PROVIDER_ALIAS);
-export const BETA_PROVIDERS = new Set(["primesrc", "vixsrc", "moviesdrive", "yflix"]);
-export const RACE_EXCLUDED = new Set(["yflix", "vixsrc", "primesrc"]);
+export const BETA_PROVIDERS = new Set(["vidsrc", "vixsrc", "moviesdrive", "yflix"]);
+export const RACE_EXCLUDED = new Set(["yflix", "vixsrc", "vidsrc"]);
 
 // Rate-limit primesrc error logging (max once per 60s)
 let lastPrimesrcErrorTime = 0;
@@ -275,7 +275,7 @@ export function normalizePrimeSrc(data, ctx) {
     if (server.sources) {
       for (const s of server.sources) {
         sources.push({
-          url: obfuscateUrl(s.url, "primesrc", ctx),
+          url: obfuscateUrl(s.url, "primesrc", ctx, s.headers),
           _probeUrl: s.url,
           type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
           label: server.name || "Default",

@@ -18,14 +18,14 @@ const SAVE_INTERVAL = 5000;
 
 const SERVER_LABELS = {
   "sv-f6a8": { name: "Turbo", tier: "ultra" },
-  "sv-v1s3": { name: "Vortex", tier: "ultra" },
+  "sv-c3d5": { name: "Alpha", tier: "ultra" },
+  "sv-h9u4": { name: "Nova", tier: "ultra" },
   "sv-a1f3": { name: "Core", tier: "premium" },
   "sv-b2e4": { name: "Fast", tier: "premium" },
   "sv-d4c6": { name: "Orbit", tier: "standard" },
   "sv-e5b7": { name: "Delta", tier: "standard" },
-  "sv-h9u4": { name: "Nova", tier: "standard" },
   "sv-v2x4": { name: "Matrix", tier: "beta" },
-  "sv-c3d5": { name: "Alpha", tier: "beta" },
+  "sv-v1s3": { name: "Vortex", tier: "beta" },
   "sv-g7b9": { name: "Flux", tier: "beta" },
   "sv-m8d1": { name: "Apollo", tier: "beta" },
 };
