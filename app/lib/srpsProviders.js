@@ -7,6 +7,129 @@ import { isBlocked } from "@/lib/blocklist";
 const NB_URL = process.env.NB_SYSTEM_URL || "http://localhost:3001";
 const CF_STREAM_PROXY = process.env.CF_STREAM_PROXY || "https://vidzen-stream-proxy.xdbypass.workers.dev";
 
+// ── Direct Piexe Scraper Globals & Helpers ─────────────────────────────────
+const IMDB_CACHE  = new Map(); // tmdb_id → imdb_id
+const STREAM_CACHE = new Map(); // imdb_id → {streams, ts}
+const STREAM_TTL  = 2 * 60 * 1000;
+const TMDB_KEY = process.env.TMDB_API_KEY || "5263089f83877823a641b104f4f8d041";
+
+const PAGE_HEADERS = {
+  Accept: "*/*",
+  Origin: "https://allmovieland.one",
+  Referer: "https://allmovieland.one/",
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:149.0) Gecko/20100101 Firefox/149.0",
+  Cookie: "_ym_uid=177701307497837718; _ym_d=1777013074; _ym_isad=1",
+};
+
+const CDN_HEADERS = {
+  "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)",
+  Referer: "https://piexe411qok.com/",
+  Origin: "https://piexe411qok.com",
+  Accept: "*/*",
+  "Content-Type": "application/x-www-form-urlencoded",
+};
+
+async function getImdbId(tmdbId, type) {
+  const key = `${type}-${tmdbId}`;
+  if (IMDB_CACHE.has(key)) return IMDB_CACHE.get(key);
+  const url = type === "movie"
+    ? `https://api.themoviedb.org/3/movie/${tmdbId}?api_key=${TMDB_KEY}`
+    : `https://api.themoviedb.org/3/tv/${tmdbId}/external_ids?api_key=${TMDB_KEY}`;
+  const res = await fetch(url);
+  if (!res.ok) throw new Error(`TMDB_FAIL:${res.status}`);
+  const data = await res.json();
+  const imdbId = data?.imdb_id || null;
+  if (imdbId) IMDB_CACHE.set(key, imdbId);
+  return imdbId;
+}
+
+async function fetchPiexeMovie(imdbId) {
+  const cached = STREAM_CACHE.get(imdbId);
+  if (cached && Date.now() - cached.ts < STREAM_TTL) return cached.streams;
+
+  const pageRes = await fetch(`https://piexe411qok.com/play/${imdbId}`, {
+    headers: PAGE_HEADERS,
+  });
+  if (!pageRes.ok) throw new Error(`PAGE_FAIL:${pageRes.status}`);
+  const html = await pageRes.text();
+
+  const p3Match = html.match(/let\s+p3\s*=\s*(\{.*?\});/s);
+  if (!p3Match) throw new Error("P3_NOT_FOUND");
+
+  let p3;
+  try { p3 = JSON.parse(p3Match[1]); } catch { throw new Error("P3_PARSE_FAIL"); }
+  if (!p3?.file || !p3?.key) throw new Error("P3_INVALID");
+
+  const listRes = await fetch(p3.file, {
+    method: "POST",
+    headers: { ...CDN_HEADERS, "X-CSRF-TOKEN": p3.key },
+  });
+
+  const ct = listRes.headers.get("content-type") || "";
+  if (!ct.includes("application/json")) throw new Error("LIST_NOT_JSON");
+
+  const listData = await listRes.json();
+  const items = Array.isArray(listData) ? listData : [listData];
+
+  const streams = [];
+  await Promise.allSettled(
+    items.filter(item => item?.file).map(async (item) => {
+      try {
+        const m3uRes = await fetch(`https://loffe414wil.com/playlist/${item.file}.txt`, {
+          method: "POST",
+          headers: { ...CDN_HEADERS, "X-CSRF-TOKEN": p3.key },
+        });
+        const url = (await m3uRes.text()).trim();
+        if (!url.includes(".m3u8")) return;
+        streams.push({ title: item.title || "English", url });
+      } catch { }
+    })
+  );
+
+  if (!streams.length) throw new Error("NO_STREAMS");
+  STREAM_CACHE.set(imdbId, { streams, ts: Date.now() });
+  return streams;
+}
+
+async function fetchPiexeTV(imdbId, season, episode) {
+  const pageRes = await fetch(`https://piexe411qok.com/play/${imdbId}`, {
+    headers: PAGE_HEADERS,
+  });
+  if (!pageRes.ok) throw new Error(`PAGE_FAIL:${pageRes.status}`);
+  const html = await pageRes.text();
+
+  const fileMatch = html.match(/file":"(.*?)"/);
+  const keyMatch  = html.match(/"key":"(.*?)"/);
+  if (!fileMatch || !keyMatch) throw new Error("TV_CONFIG_NOT_FOUND");
+
+  const key = keyMatch[1];
+  let playlistUrl = fileMatch[1].replace(/\\\//g, "/");
+  if (!playlistUrl.startsWith("http")) playlistUrl = `https://piexe411qok.com${playlistUrl}`;
+
+  const headers = { ...CDN_HEADERS, "X-CSRF-TOKEN": key };
+  const data = await fetch(playlistUrl, { method: "POST", headers })
+    .then(r => r.json());
+
+  const subs = data?.[parseInt(season) - 1]?.folder?.[parseInt(episode) - 1]?.folder;
+  if (!Array.isArray(subs)) throw new Error("TV_INVALID_STRUCTURE");
+
+  const streams = [];
+  await Promise.allSettled(
+    subs.filter(s => s?.file).map(async (sub) => {
+      try {
+        const m3u8 = await fetch(`https://piexe411qok.com/playlist/${sub.file}.txt`, {
+          method: "POST",
+          headers,
+        }).then(r => r.text());
+        streams.push({ title: sub.title || "English", url: m3u8.trim() });
+      } catch { }
+    })
+  );
+
+  if (!streams.length) throw new Error("NO_TV_STREAMS");
+  return streams;
+}
+
 // ── Provider name obfuscation ─────────────────────────────────────────────
 export const PROVIDER_ALIAS = {
   primesrc: "sv-c3d5",
@@ -103,8 +226,20 @@ export function rewriteProxyUrl(url) {
 }
 
 // ── Vault a source URL — returns /api/stream/{id} with media context ────────
-export function obfuscateUrl(url, server, ctx = {}) {
+export function obfuscateUrl(url, server, ctx = {}, customHeaders = null) {
   if (!url) return url;
+
+  if (server === "piexe") {
+    return vaultUrl(url, {
+      origin: "https://piexe411qok.com",
+      referer: "https://piexe411qok.com/",
+      provider: "piexe",
+      mediaType: ctx.type || null,
+      mediaId: ctx.id || null,
+      season: ctx.season || null,
+      episode: ctx.episode || null,
+    });
+  }
 
   const unwrapped = unwrapProxyUrl(url);
   if (unwrapped) {
@@ -121,8 +256,8 @@ export function obfuscateUrl(url, server, ctx = {}) {
 
   const resolved = rewriteProxyUrl(url);
   return vaultUrl(resolved, {
-    origin: server === "moviebox" ? null : NB_URL,
-    referer: server === "moviebox" ? null : NB_URL,
+    origin: customHeaders?.origin || (server === "moviebox" ? null : NB_URL),
+    referer: customHeaders?.referer || (server === "moviebox" ? null : NB_URL),
     provider: server,
     mediaType: ctx.type || null,
     mediaId: ctx.id || null,
@@ -181,7 +316,7 @@ export function normalizeStream(data, ctx) {
 export function normalizeMoviebox(data, ctx) {
   if (!data?.sources?.length) return null;
   const sources = data.sources.map(s => ({
-    url: obfuscateUrl(s.url, "moviebox", ctx),
+    url: obfuscateUrl(s.url, "moviebox", ctx, s.headers),
     _probeUrl: s.url,
     type: s.type === "hls" || s.url?.includes(".m3u8") ? "hls" : "mp4",
     label: [s.quality && `${s.quality}p`, s.dub && s.dub !== "Original" ? s.dub : null].filter(Boolean).join(" ") || "Default",
@@ -330,19 +465,40 @@ export function tryVidfast(type, id, season, episode) {
 
 export function tryMoviebox(type, id, season, episode) {
   const path = type === "movie"
-    ? `/api/peach/moviebox/movie/${id}`
-    : `/api/peach/moviebox/tv/${id}/season/${season}/episode/${episode}`;
-  const origin = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
+    ? `${NB_URL}/stream/moviebox/movie/${id}`
+    : `${NB_URL}/stream/moviebox/tv/${id}/${season}/${episode}`;
   const ctx = { type, id, season, episode };
-  return fetchJSON(`${origin}${path}`, 15000).then(data => normalizeMoviebox(data, ctx));
+  return fetchJSON(path, 15000).then(data => normalizeMoviebox(data, ctx));
 }
 
-export function tryPiexe(type, id, season, episode) {
-  const origin = process.env.NEXT_PUBLIC_SITE_URL || "http://localhost:3000";
-  const params = new URLSearchParams({ id, type });
-  if (season) { params.set("season", season); params.set("ep", episode); }
-  const ctx = { type, id, season, episode };
-  return fetchJSON(`${origin}/api/piexe?${params}`, 15000).then(data => normalizePiexe(data, ctx));
+export async function tryPiexe(type, id, season, episode) {
+  try {
+    const imdbId = await getImdbId(id, type);
+    if (!imdbId) return null;
+
+    let rawStreams;
+    if (type === "tv") {
+      rawStreams = await fetchPiexeTV(imdbId, season, episode);
+    } else {
+      rawStreams = await fetchPiexeMovie(imdbId);
+    }
+
+    if (!rawStreams || !rawStreams.length) return null;
+
+    const ctx = { type, id, season, episode };
+    const sources = rawStreams.map(s => ({
+      url: obfuscateUrl(s.url, "piexe", ctx),
+      _probeUrl: s.url,
+      type: "hls",
+      label: s.title,
+      server: maskName("piexe"),
+    }));
+
+    return { sources, subtitles: [] };
+  } catch (err) {
+    console.warn("[piexe-direct] Scraper failed:", err.message);
+    return null;
+  }
 }
 
 export function tryVidlink(type, id, season, episode) {

@@ -70,3 +70,4 @@ nb-system/*
 /*.js
 *.zip
 /test_extract/*
+*.png

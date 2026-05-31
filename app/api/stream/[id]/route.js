@@ -128,13 +128,25 @@ export async function GET(request, { params }) {
 
   const { url, origin, referer, cfProxy, redirect } = entry;
 
+  // ── Unwrap VPS proxy URLs dynamically to query directly ───────────────
+  let activeUrl = url;
+  let activeOrigin = origin;
+  let activeReferer = referer;
+
+  const unwrapped = unwrapVpsProxyUrl(url);
+  if (unwrapped) {
+    activeUrl = unwrapped.url;
+    if (unwrapped.origin) activeOrigin = unwrapped.origin;
+    if (unwrapped.referer) activeReferer = unwrapped.referer;
+  }
+
   // ── Direct redirect: browser fetches CDN directly (for CORS-enabled CDNs) ──
   if (redirect) {
-    console.log(`[Stream] Redirect → ${url.substring(0, 80)}...`);
+    console.log(`[Stream] Redirect → ${activeUrl.substring(0, 80)}...`);
     return new Response(null, {
       status: 302,
       headers: {
-        "Location": url,
+        "Location": activeUrl,
         "Access-Control-Allow-Origin": "*",
         "Cache-Control": "no-store",
       },
@@ -143,7 +155,7 @@ export async function GET(request, { params }) {
 
   // ── Route through CF Worker if cfProxy is set (datacenter-blocked CDNs) ──
   if (cfProxy) {
-    const fetchUrl = `${cfProxy}/p?url=${encodeURIComponent(url)}`;
+    const fetchUrl = `${cfProxy}/p?url=${encodeURIComponent(activeUrl)}`;
     return new Response(null, {
       status: 302,
       headers: {
@@ -156,11 +168,11 @@ export async function GET(request, { params }) {
 
   // ── Build upstream headers ──────────────────────────────────────────
   const upstreamHeaders = { "User-Agent": UA };
-  if (origin) upstreamHeaders["Origin"] = origin;
-  if (referer) upstreamHeaders["Referer"] = referer;
+  if (activeOrigin) upstreamHeaders["Origin"] = activeOrigin;
+  if (activeReferer) upstreamHeaders["Referer"] = activeReferer;
 
   // Add API key for backend proxy requests (nginx auth)
-  if (url.includes("backend.vidzen.fun")) {
+  if (activeUrl.includes("backend.vidzen.fun")) {
     upstreamHeaders["X-API-Key"] = process.env.API_GATEWAY_KEY || "";
   }
 
@@ -169,32 +181,44 @@ export async function GET(request, { params }) {
   if (rangeHeader) upstreamHeaders["Range"] = rangeHeader;
 
   try {
-    console.log(`[Stream] Fetching: ${url.substring(0, 120)}...`);
-    let upstreamRes = await fetch(url, {
+    console.log(`[Stream] Fetching: ${activeUrl.substring(0, 120)}...`);
+    let upstreamRes = await fetch(activeUrl, {
       headers: upstreamHeaders,
       redirect: "follow",
     });
 
+    let contentType = (upstreamRes.headers.get("content-type") || "").toLowerCase();
+    
+    // Check if the request got blocked by Cloudflare (either 403, or 200/HTML challenge)
+    const isM3u8Request = activeUrl.includes(".m3u8") || contentType.includes("mpegurl") || contentType.includes("apple");
+    const isCloudflareBlock = upstreamRes.status === 403 || (upstreamRes.status === 200 && contentType.includes("text/html") && isM3u8Request);
+
     // ── Fallback for Cloudflare TLS fingerprinting blocks ────────────────
-    if (upstreamRes.status === 403 && (url.includes("midwesteagle.com") || url.includes(".m3u8"))) {
-      console.warn(`[Stream] Node fetch blocked by CF (403). Falling back to python curl_cffi for ${url.substring(0, 80)}`);
+    if (isCloudflareBlock) {
+      console.warn(`[Stream] Node fetch blocked by CF (${upstreamRes.status}). Falling back to python curl_cffi for ${activeUrl.substring(0, 80)}`);
       try {
         const scriptPath = path.join(process.cwd(), "app", "lib", "cf_fetch.py");
-        const { stdout } = await execFileAsync("python", [scriptPath, url, referer || "", origin || ""]);
+        const { stdout } = await execFileAsync("python", [scriptPath, activeUrl, activeReferer || "", activeOrigin || ""]);
         const cfResult = JSON.parse(stdout);
         
         if (cfResult.error) {
           console.error("[Stream] cf_fetch.py error:", cfResult.error);
         } else if (cfResult.status === 200) {
-          const rewritten = await rewriteM3U8(cfResult.text, url, origin, referer, cfProxy);
-          return new Response(rewritten, {
-            status: 200,
-            headers: {
-              "Content-Type": "application/vnd.apple.mpegurl",
-              "Access-Control-Allow-Origin": "*",
-              "Cache-Control": "no-store",
-            },
-          });
+          // If the curl_cffi successfully resolved it as m3u8
+          const cfContentType = (cfResult.headers["content-type"] || "").toLowerCase();
+          if (cfContentType.includes("text/html")) {
+            console.error("[Stream] curl_cffi fallback also returned HTML (Turnstile solve failed)");
+          } else {
+            const rewritten = await rewriteM3U8(cfResult.text, activeUrl, activeOrigin, activeReferer, cfProxy);
+            return new Response(rewritten, {
+              status: 200,
+              headers: {
+                "Content-Type": "application/vnd.apple.mpegurl",
+                "Access-Control-Allow-Origin": "*",
+                "Cache-Control": "no-store",
+              },
+            });
+          }
         }
       } catch (cfErr) {
         console.error("[Stream] Python fallback execution failed:", cfErr.message);
@@ -202,14 +226,14 @@ export async function GET(request, { params }) {
     }
 
     let errClass = ErrorClass.OK;
-    if (!upstreamRes.ok && upstreamRes.status !== 206) {
+    if (!upstreamRes.ok && upstreamRes.status !== 206 && !isCloudflareBlock) {
       errClass = classifyHttpError(upstreamRes.status);
       
       // ── SFBS: Retry once if recoverable (e.g., 502/503/timeout) ────────
       if (!isFatal(errClass)) {
         console.warn(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}, retrying once...`);
         await new Promise(r => setTimeout(r, 800));
-        upstreamRes = await fetch(url, {
+        upstreamRes = await fetch(activeUrl, {
           headers: upstreamHeaders,
           redirect: "follow",
         });
@@ -222,7 +246,7 @@ export async function GET(request, { params }) {
 
       // If still failing, return fatal error to player
       if (!upstreamRes.ok && upstreamRes.status !== 206) {
-        console.error(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}: ${url.substring(0, 100)}`);
+        console.error(`[Stream] Upstream ${upstreamRes.status} (${errClass}) for ${id}: ${activeUrl.substring(0, 100)}`);
         handleFatalFailure(entry, errClass);
         return new Response(JSON.stringify({ error: "upstream_error", status: upstreamRes.status, class: errClass }), {
           status: 502,
@@ -235,11 +259,12 @@ export async function GET(request, { params }) {
       }
     }
 
-    const contentType = (upstreamRes.headers.get("content-type") || "").toLowerCase();
+    // Re-read content type after potential fetches
+    contentType = (upstreamRes.headers.get("content-type") || "").toLowerCase();
 
     // ── SFBS: Block HTML responses (usually CDN errors/blocks) ──────────
-    if (contentType.includes("text/html") || url.endsWith(".html")) {
-      console.error(`[Stream] Upstream returned HTML instead of media for ${id}: ${url.substring(0, 100)}`);
+    if ((contentType.includes("text/html") || activeUrl.endsWith(".html")) && !isCloudflareBlock) {
+      console.error(`[Stream] Upstream returned HTML instead of media for ${id}: ${activeUrl.substring(0, 100)}`);
       handleFatalFailure(entry, ErrorClass.FATAL_INVALID);
       return new Response(JSON.stringify({ error: "invalid_content_type", class: ErrorClass.FATAL_INVALID }), {
         status: 502,
@@ -255,10 +280,10 @@ export async function GET(request, { params }) {
     if (
       contentType.includes("mpegurl") ||
       contentType.includes("apple") ||
-      url.includes(".m3u8")
+      activeUrl.includes(".m3u8")
     ) {
       const body = await upstreamRes.text();
-      const rewritten = await rewriteM3U8(body, url, origin, referer, cfProxy);
+      const rewritten = await rewriteM3U8(body, activeUrl, activeOrigin, activeReferer, cfProxy);
       return new Response(rewritten, {
         status: 200,
         headers: {
