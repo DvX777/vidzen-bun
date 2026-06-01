@@ -29,6 +29,20 @@ export const BLOCKLIST = [
   { type: "tv", id: "279013", reason: "MarkScan DMCA 2026-05-28" },
   { type: "tv", id: "258842", reason: "MarkScan DMCA 2026-05-28" },
   { type: "tv", id: "296243", reason: "MarkScan DMCA 2026-05-28" },
+
+  // ── TV Episodes ─────────────────────────────────────────────────────────
+  { type: "tv", id: "115145", season: "1", episode: "1", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "10", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "11", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "12", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "2", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "3", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "4", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "5", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "6", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "7", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "8", reason: "ALS Block 2026-06-01" },
+  { type: "tv", id: "115145", season: "1", episode: "9", reason: "ALS Block 2026-06-01" },
 ];
 
 /**
