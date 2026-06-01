@@ -73,6 +73,9 @@ const SKIP_PROBE_SERVERS = new Set([
   "sv-b2e4",  // vidfast
   "sv-v1s3",  // vidsrc
   "sv-f6a8",  // vidlink (redirect mode — browser fetches directly)
+  "sv-c3d5",  // primesrc (Streamtape/Alpha blocks datacenter probes)
+  "sv-e5b7",  // piexe (on-the-fly scraped streams / strict referrer checking)
+  "sv-d4c6",  // moviebox (FMovies CDN blocks datacenter HEAD probes with 403)
 ]);
 
 /**

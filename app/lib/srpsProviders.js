@@ -444,7 +444,7 @@ export function tryPrimeSrc(type, id, season, episode) {
     ? `${NB_URL}/movie-tv/primesrc/movie/${id}`
     : `${NB_URL}/movie-tv/primesrc/tv/${id}/${season}/${episode}`;
   const ctx = { type, id, season, episode };
-  return fetchJSON(path, 8000).then(data => normalizePrimeSrc(data, ctx));
+  return fetchJSON(path, 30000).then(data => normalizePrimeSrc(data, ctx));
 }
 
 export function tryVidcore(type, id, season, episode) {
@@ -489,6 +489,8 @@ export async function tryPiexe(type, id, season, episode) {
     const sources = rawStreams.map(s => ({
       url: obfuscateUrl(s.url, "piexe", ctx),
       _probeUrl: s.url,
+      _probeOrigin: "https://piexe411qok.com",
+      _probeReferer: "https://piexe411qok.com/",
       type: "hls",
       label: s.title,
       server: maskName("piexe"),
