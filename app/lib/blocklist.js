@@ -15,6 +15,7 @@
 export const BLOCKLIST = [
   // ── Movies ──────────────────────────────────────────────────────────────
   { type: "movie", id: "1613798", reason: "MarkScan DMCA 2026-05-28" },
+  { type: "movie", id: "1286185", reason: "ALS Block 2026-06-02" },
 
   // ── TV Shows (entire series blocked) ────────────────────────────────────
   // Shows: 290321, 299172, 275202, 259702, 230424, 248488, 137883, 279013,
